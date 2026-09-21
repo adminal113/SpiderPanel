@@ -110,4 +110,4 @@ https://raw.githubusercontent.com/amirh00sain/SpiderPanel/main/start.sh
 
 ### SpiderPanel
 
-**Developed with** [**@amirspl1der**](https://t.me/amirspl1der)
+**created by** [**@amirspl1der**](https://t.me/amirspl1der)
