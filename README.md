@@ -111,5 +111,3 @@ https://raw.githubusercontent.com/amirh00sain/SpiderPanel/main/start.sh
 ### SpiderPanel
 
 **Developed with** [**@amirspl1der**](https://t.me/amirspl1der)
-
-اگر پروژه برای شما مفید بود، با یک Star از آن حمایت کنید.
