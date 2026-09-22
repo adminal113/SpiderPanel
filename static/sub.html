@@ -991,6 +991,28 @@ body {
   .quick-content-pane { padding: 16px 14px; }
   .clients-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
 }
+
+/* Prevent Android/iOS blue touch highlight on tap. Keep focus styling under our control. */
+html, body, button, a, input, select, textarea, summary,
+[role="button"], [tabindex], .btn, .btn-p, .btn-g, .btn-r, .btn-b, .btn-gr, .btn-glass,
+.nav-item, .nav-accordion-head, .spd-acc-head, .bot-tab, .bot-acc-head, .tab, .scn-tab,
+.cfg-copy-btn, .theme-dot, .lang-btn, .login-btn {
+  -webkit-tap-highlight-color: transparent !important;
+  -webkit-touch-callout: none;
+}
+
+/* Remove the native blue touch/focus flash while retaining keyboard focus visibility. */
+button, a, summary, [role="button"], .btn, .nav-item, .nav-accordion-head, .spd-acc-head,
+.bot-tab, .bot-acc-head, .tab, .scn-tab, .cfg-copy-btn, .theme-dot, .lang-btn, .login-btn {
+  outline: none;
+}
+
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+[role="button"]:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
 </style>
 </head>
 <body>
@@ -1661,11 +1683,22 @@ body {
       btn.addEventListener("click", function() {
         var i = parseInt(btn.getAttribute("data-index"), 10);
         setText("qrName", CONFIG_NAMES[i] || "config");
-        if (qrC && typeof QRCode !== "undefined" && CONFIG_LINKS[i]) {
+        if (qrC && CONFIG_LINKS[i] && SUB_ID) {
+          // Use the panel's own QR endpoint so every config gets a real QR image.
           qrC.innerHTML = "";
-          QRCode.toCanvas(CONFIG_LINKS[i], { width: 170, margin: 1 }, function(err, canvas) {
-            if (!err && canvas) qrC.appendChild(canvas);
-          });
+          var qrImg = document.createElement("img");
+          qrImg.alt = "QR Code";
+          qrImg.width = 170;
+          qrImg.height = 170;
+          qrImg.style.width = "170px";
+          qrImg.style.height = "170px";
+          qrImg.style.display = "block";
+          qrImg.style.imageRendering = "pixelated";
+          qrImg.src = "/api/sub/" + encodeURIComponent(SUB_ID) + "/qr?cfg=" + encodeURIComponent(String(i)) + "&t=" + Date.now();
+          qrImg.onerror = function() {
+            qrC.innerHTML = '<span style="color:#777;font-size:12px">QR unavailable</span>';
+          };
+          qrC.appendChild(qrImg);
         }
         if (modal) modal.classList.add("show");
       });

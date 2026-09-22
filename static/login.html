@@ -241,6 +241,28 @@ body {
         font-size: 0.65rem;
     }
 }
+
+/* Prevent Android/iOS blue touch highlight on tap. Keep focus styling under our control. */
+html, body, button, a, input, select, textarea, summary,
+[role="button"], [tabindex], .btn, .btn-p, .btn-g, .btn-r, .btn-b, .btn-gr, .btn-glass,
+.nav-item, .nav-accordion-head, .spd-acc-head, .bot-tab, .bot-acc-head, .tab, .scn-tab,
+.cfg-copy-btn, .theme-dot, .lang-btn, .login-btn {
+  -webkit-tap-highlight-color: transparent !important;
+  -webkit-touch-callout: none;
+}
+
+/* Remove the native blue touch/focus flash while retaining keyboard focus visibility. */
+button, a, summary, [role="button"], .btn, .nav-item, .nav-accordion-head, .spd-acc-head,
+.bot-tab, .bot-acc-head, .tab, .scn-tab, .cfg-copy-btn, .theme-dot, .lang-btn, .login-btn {
+  outline: none;
+}
+
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+[role="button"]:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
 </style>
 </head>
 <body class="h-screen w-screen overflow-hidden flex items-center justify-center relative">

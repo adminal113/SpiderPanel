@@ -1088,6 +1088,30 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
 }
 .login-btn::after{display:none!important}
 
+
+/* Clickable TCP domain/IP values */
+.scn-copy-value{
+  appearance:none;
+  -webkit-appearance:none;
+  border:0;
+  background:transparent;
+  color:inherit;
+  font:inherit;
+  cursor:pointer;
+  text-align:inherit;
+  padding:0;
+  min-width:0;
+}
+.scn-copy-value:hover{
+  text-decoration:underline;
+  text-underline-offset:3px;
+}
+.scn-copy-value:disabled{
+  cursor:default;
+  text-decoration:none;
+  opacity:.55;
+}
+
 /* Node inbound editor: only the node selector is shown. */
 .node-only-hidden{display:none!important}
 #mod-inbound.inbound-node-only .modal-c{max-width:560px}
@@ -1099,6 +1123,28 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
 /* Neutral selected node rows in both themes, without colored fills. */
 .node-select-row.selected{background:var(--nav-bg)!important;border-color:var(--border-glow)!important}
 .node-select-row:hover{background:var(--nav-bg)!important;border-color:var(--border-glow)!important}
+
+/* Prevent Android/iOS blue touch highlight on tap. Keep focus styling under our control. */
+html, body, button, a, input, select, textarea, summary,
+[role="button"], [tabindex], .btn, .btn-p, .btn-g, .btn-r, .btn-b, .btn-gr, .btn-glass,
+.nav-item, .nav-accordion-head, .spd-acc-head, .bot-tab, .bot-acc-head, .tab, .scn-tab,
+.cfg-copy-btn, .theme-dot, .lang-btn, .login-btn {
+  -webkit-tap-highlight-color: transparent !important;
+  -webkit-touch-callout: none;
+}
+
+/* Remove the native blue touch/focus flash while retaining keyboard focus visibility. */
+button, a, summary, [role="button"], .btn, .nav-item, .nav-accordion-head, .spd-acc-head,
+.bot-tab, .bot-acc-head, .tab, .scn-tab, .cfg-copy-btn, .theme-dot, .lang-btn, .login-btn {
+  outline: none;
+}
+
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+[role="button"]:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
 </style>
 </head>
 <body>
@@ -1520,8 +1566,8 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
 
           <div id="bot-sub-channel" class="bot-subpanel active">
             <div class="bot-acc-list">
-              <div class="bot-acc open" id="botacc-channel-main">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-channel-main')"><span>📣 انتشار زمان‌بندی‌شده</span><span class="material-symbols-outlined">expand_more</span></button>
+              <div class="bot-acc" id="botacc-channel-main">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-channel-main')" aria-expanded="false"><span>📣 انتشار زمان‌بندی‌شده</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="f-g"><label>فعال‌سازی</label><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="bot-channel-enabled" type="checkbox"> ایجاد و ارسال خودکار</label></div>
                   <div class="f-g"><label>لینک Channel</label><input id="bot-channel" type="text" dir="ltr" placeholder="https://t.me/mychannel یا @mychannel"></div>
@@ -1540,7 +1586,7 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
                 </div>
               </div>
               <div class="bot-acc" id="botacc-channel-status">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-channel-status')"><span>📊 وضعیت Channel Bot</span><span class="material-symbols-outlined">expand_more</span></button>
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-channel-status')" aria-expanded="false"><span>📊 وضعیت Channel Bot</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body"><div id="bot-channel-next" class="bot-status-grid"></div></div>
               </div>
             </div>
@@ -1548,8 +1594,8 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
 
           <div id="bot-sub-sell" class="bot-subpanel">
             <div class="bot-acc-list">
-              <div class="bot-acc open" id="botacc-sell-general">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-general')"><span>⚙️ تنظیمات Sell Bot</span><span class="material-symbols-outlined">expand_more</span></button>
+              <div class="bot-acc" id="botacc-sell-general">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-general')" aria-expanded="false"><span>⚙️ تنظیمات Sell Bot</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="f-g"><label>فعال‌سازی</label><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="bot-sell-enabled" type="checkbox"> فعال‌سازی فروش و بررسی رسید</label></div>
                   <div class="f-g"><label>Admin Numeric Telegram ID</label><input id="bot-sell-admin" type="text" dir="ltr" inputmode="numeric" placeholder="123456789"></div>
@@ -1557,8 +1603,8 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
                 </div>
               </div>
 
-              <div class="bot-acc open" id="botacc-sell-products">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-products')"><span>🛍 محصولات و Planها</span><span class="material-symbols-outlined">expand_more</span></button>
+              <div class="bot-acc" id="botacc-sell-products">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-products')" aria-expanded="false"><span>🛍 محصولات و Planها</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="bot-note">هر Plan کاملاً مستقل است و می‌تواند Inbound، حجم، زمان، قیمت و پیشوند کاربر خودش را داشته باشد. حذف آخرین Plan نیز مجاز است.</div>
                   <input id="bot-plan-id" type="hidden">
@@ -1576,7 +1622,7 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
               </div>
 
               <div class="bot-acc" id="botacc-sell-join">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-join')"><span>🔒 جوین اجباری</span><span class="material-symbols-outlined">expand_more</span></button>
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-join')" aria-expanded="false"><span>🔒 جوین اجباری</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="bot-note">هر تعداد Channel که بخواهی می‌توانی اضافه کنی. برای @username، Join Link خودکار ساخته می‌شود. برای کانال عددی، Join Link را هم وارد کن.</div>
                   <div id="bot-join-list" class="bot-join-list"></div>
@@ -1585,7 +1631,7 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
               </div>
 
               <div class="bot-acc" id="botacc-sell-payment">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-payment')"><span>💳 پرداخت</span><span class="material-symbols-outlined">expand_more</span></button>
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-payment')" aria-expanded="false"><span>💳 پرداخت</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="f-g"><label>لینک پرداخت (اختیاری)</label><input id="bot-sell-payment" type="url" dir="ltr" placeholder="https://..."></div>
                   <div class="f-g"><label>اطلاعات پرداخت</label><textarea id="bot-sell-payment-details" rows="4" placeholder="شماره کارت، نام صاحب حساب، توضیحات پرداخت و ..."></textarea></div>
@@ -1593,7 +1639,7 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
               </div>
 
               <div class="bot-acc" id="botacc-sell-support">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-support')"><span>💬 پشتیبانی</span><span class="material-symbols-outlined">expand_more</span></button>
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-support')" aria-expanded="false"><span>💬 پشتیبانی</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="f-g"><label>Username / لینک پشتیبانی</label><input id="bot-sell-support" type="text" dir="ltr" placeholder="@support یا https://t.me/support"></div>
                   <div class="f-g"><label>متن بخش پشتیبانی</label><textarea id="bot-sell-support-text" rows="3" placeholder="برای پشتیبانی ..."></textarea></div>
@@ -1601,7 +1647,7 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
               </div>
 
               <div class="bot-acc" id="botacc-sell-orders">
-                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-orders')"><span>🧾 سفارش‌ها و وضعیت فروش</span><span class="material-symbols-outlined">expand_more</span></button>
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-orders')" aria-expanded="false"><span>🧾 سفارش‌ها و وضعیت فروش</span><span class="material-symbols-outlined">expand_more</span></button>
                 <div class="bot-acc-body">
                   <div class="bot-note">خریدار: محصول → پرداخت → ارسال رسید. ادمین: دریافت رسید → ✅ تأیید و فعال‌سازی / ❌ رد. برای جلوگیری از دوباره‌کاری، فعال‌سازی idempotent است.</div>
                   <div id="bot-sell-orders" class="bot-status-grid"></div>
@@ -3997,9 +4043,28 @@ async function scnRunTCP() {
   }
   var html = '';
   out.forEach(function(o) {
-    html += '<div class="scn-result"><span class="scn-dom-name">' + esc(o.dom) + '</span><span class="scn-ip">' + (o.ip || '—') + '</span>' + scnMsHtml(o.ms, o.failed) + '</div>';
+    var dom = String(o.dom || '');
+    var ip = String(o.ip || '');
+    html += '<div class="scn-result">' +
+      '<button type="button" class="scn-copy-value scn-dom-name" data-copy="' + esc(dom) + '" title="Copy domain">' + esc(dom) + '</button>' +
+      '<button type="button" class="scn-copy-value scn-ip" data-copy="' + esc(ip) + '" title="Copy IP"' + (ip ? '' : ' disabled') + '>' + esc(ip || '—') + '</button>' +
+      scnMsHtml(o.ms, o.failed) +
+      '</div>';
   });
   resEl.innerHTML = html || '<div class="scn-empty">' + t('noResult') + '</div>';
+  resEl.querySelectorAll('.scn-copy-value').forEach(function(el) {
+    if (el._copyBound) return;
+    el._copyBound = true;
+    el.addEventListener('click', function() {
+      var value = el.getAttribute('data-copy') || '';
+      if (!value) return;
+      copyText(value).then(function() {
+        toast(value, 'ok');
+      }).catch(function() {
+        toast(t('toastErr') || 'Copy failed', 'err');
+      });
+    });
+  });
   if (btn) { btn.disabled = false; btn.textContent = t('checkDomains'); }
 }
 
@@ -4795,7 +4860,13 @@ async function syncAllNodes(){
 
 
 // ─── TELEGRAM BOT ───────────────────────────────────────────────────────────
-function toggleBotAcc(id){var el=$id(id);if(el)el.classList.toggle('open');}
+function toggleBotAcc(id){
+  var el=$id(id);
+  if(!el) return;
+  var open=el.classList.toggle('open');
+  var btn=el.querySelector('.bot-acc-head');
+  if(btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
 function switchBotSubtab(which) {
   ['channel','sell'].forEach(function(k){
     var pane=$id('bot-sub-'+k), btn=$id('bot-tab-'+k+'-btn');
