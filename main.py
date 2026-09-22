@@ -285,6 +285,7 @@ async def load_state():
             INBOUNDS.update(data.get("inbounds", {}))
             NODES.update(data.get("nodes", {}))
             PENDING_NODE_DELETIONS.update(data.get("pending_node_deletions", {}))
+            BOT_ORDERS.update(data.get("bot_orders", {}))
             IP_POOL.clear()
             IP_POOL.extend(data.get("ip_pool", []))
             IP_BLACKLIST.clear()
@@ -432,6 +433,7 @@ async def save_state():
                 "worker": dict(WORKER),
                 "nodes": dict(NODES),
                 "pending_node_deletions": dict(PENDING_NODE_DELETIONS),
+                "bot_orders": dict(BOT_ORDERS),
                 "password_hash": AUTH["password_hash"],
                 "saved_secret": CONFIG["secret"],
                 "saved_at": datetime.now().isoformat(),
@@ -440,6 +442,10 @@ async def save_state():
             async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=2))
             tmp.replace(DATA_FILE)
+            try:
+                os.chmod(DATA_FILE, 0o600)
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"Could not save state: {e}")
 
@@ -499,6 +505,43 @@ SETTINGS = {
     # Panel audio (uploaded by admin)
     "panel_audio": "",
     "panel_audio_enabled": False,
+    # Telegram bot automation. The token is stored server-side only and never
+    # returned to the browser in full. Channel Bot is scheduled/push-only;
+    # Sell Bot reuses the same token for private-chat commands and approvals.
+    "telegram_bot": {
+        "token": "",
+        "channel": {
+            "enabled": False,
+            "channel": "",
+            "interval_minutes": 60,
+            "username_prefix": "spider",
+            "traffic_limit_gb": 0,
+            "expire_days": 30,
+            "inbound_id": "",
+            "last_run_at": "",
+            "last_user_id": "",
+            "last_message_id": 0,
+            "success_count": 0,
+            "error_count": 0,
+            "last_error": "",
+            "next_run_at": "",
+        },
+        "sell": {
+            "enabled": False,
+            "admin_chat_id": "",
+            "support_username": "",
+            "plan_name": "1 ماهه",
+            "price": "",
+            "traffic_gb": 50,
+            "expire_days": 30,
+            "payment_url": "",
+            "required_channels": [],
+            "welcome_text": "سلام 👋\nبرای مشاهده پلن‌ها /plans را بفرستید.",
+            "last_update_at": "",
+            "last_error": "",
+            "offset": 0,
+        },
+    },
     # Reality defaults (3x-ui style)
     "reality": {
         "port": 1234,
@@ -595,6 +638,22 @@ WORKER: dict = {
 WORKER_LOCK = asyncio.Lock()
 # Serialize source syncs (hourly loop + manual button can't overlap).
 WORKER_SYNC_LOCK = asyncio.Lock()
+
+# ── Telegram Bot automation ─────────────────────────────────────────────────
+# One scheduler handles channel publishing. One long-poller handles Sell Bot
+# commands. They intentionally share the configured Telegram bot token so a
+# single BotFather bot can do both jobs without update-stream conflicts.
+BOT_SCHEDULER_TASK = None
+BOT_POLL_TASK = None
+BOT_WAKE = asyncio.Event()
+BOT_ORDERS: dict = {}  # order_id -> {chat_id, username, plan, status, created_at, ...}
+BOT_ADMIN_WIZARD: dict = {}  # admin_id -> {mode, step, plan, started_at}
+BOT_ADMIN_WIZARD_LOCK = asyncio.Lock()
+BOT_ORDERS_LOCK = asyncio.Lock()
+BOT_LAST_UPDATE_LOCK = asyncio.Lock()
+BOT_CUSTOMER_UI: dict = {}  # chat_id -> {menu_message_id, section, updated_at}
+BOT_CUSTOMER_UI_LOCK = asyncio.Lock()
+BOT_EXPIRY_TASK = None
 
 # ── Telegram Proxy Instances ────────────────────────────────────────────────
 # Maps inbound_id → MTProtoProxyServer instance
@@ -1348,6 +1407,13 @@ async def startup():
     asyncio.create_task(_worker_proxy_sync_loop())
     asyncio.create_task(_worker_auto_sync_loop())
     asyncio.create_task(_xray_client_audit_loop())
+    global BOT_SCHEDULER_TASK, BOT_POLL_TASK, BOT_EXPIRY_TASK
+    if BOT_SCHEDULER_TASK is None or BOT_SCHEDULER_TASK.done():
+        BOT_SCHEDULER_TASK = asyncio.create_task(_channel_bot_loop(), name="spider-channel-bot")
+    if BOT_POLL_TASK is None or BOT_POLL_TASK.done():
+        BOT_POLL_TASK = asyncio.create_task(_sell_bot_loop(), name="spider-sell-bot")
+    if BOT_EXPIRY_TASK is None or BOT_EXPIRY_TASK.done():
+        BOT_EXPIRY_TASK = asyncio.create_task(_sell_bot_expiry_loop(), name="spider-expiry-sweeper")
 
     # Start Telegram Proxy instances for all existing TG inbounds
     await _start_all_telegram_proxies()
@@ -1530,6 +1596,18 @@ async def _worker_auto_sync_loop():
 
 @app.on_event("shutdown")
 async def shutdown():
+    global BOT_SCHEDULER_TASK, BOT_POLL_TASK
+    for _task_name in ("BOT_SCHEDULER_TASK", "BOT_POLL_TASK"):
+        _task = globals().get(_task_name)
+        if _task and not _task.done():
+            _task.cancel()
+    for _task_name in ("BOT_SCHEDULER_TASK", "BOT_POLL_TASK"):
+        _task = globals().get(_task_name)
+        if _task:
+            try:
+                await _task
+            except asyncio.CancelledError:
+                pass
     global NODE_HEARTBEAT_TASK, PUBLIC_ENDPOINT_TASK, PUBLIC_ENDPOINT_WORKER_SYNC_TASK
     if PUBLIC_ENDPOINT_WORKER_SYNC_TASK is not None and not PUBLIC_ENDPOINT_WORKER_SYNC_TASK.done():
         PUBLIC_ENDPOINT_WORKER_SYNC_TASK.cancel()
@@ -11251,6 +11329,1944 @@ async def scanner_sni_fastest(_=Depends(require_auth)):
     if results:
         return {"ok": True, "sni": results[0]["sni"], "latency_ms": results[0].get("latency_ms", 0)}
     return {"ok": False, "sni": "", "latency_ms": 0}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM BOT AUTOMATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _bot_cfg() -> dict:
+    cfg = SETTINGS.setdefault("telegram_bot", {})
+    cfg.setdefault("token", "")
+    cfg.setdefault("channel", {})
+    cfg.setdefault("sell", {})
+
+    ch = cfg["channel"]
+    ch.setdefault("enabled", False)
+    ch.setdefault("channel", "")
+    ch.setdefault("interval_minutes", 60)
+    ch.setdefault("username_prefix", "spider")
+    ch.setdefault("traffic_limit_gb", 0)
+    ch.setdefault("expire_days", 30)
+    ch.setdefault("inbound_id", "")
+    ch.setdefault("replace_previous", True)
+    ch.setdefault("pending_delete_user_ids", [])
+    ch.setdefault("last_run_at", "")
+    ch.setdefault("last_user_id", "")
+    ch.setdefault("last_message_id", 0)
+    ch.setdefault("success_count", 0)
+    ch.setdefault("error_count", 0)
+    ch.setdefault("last_error", "")
+    ch.setdefault("last_delete_error", "")
+    ch.setdefault("next_run_at", "")
+
+    sell = cfg["sell"]
+    sell.setdefault("enabled", False)
+    sell.setdefault("admin_chat_id", "")
+    sell.setdefault("support_username", "")
+    sell.setdefault("support_text", "💬 برای پشتیبانی با مدیر فروش تماس بگیرید.")
+    sell.setdefault("payment_url", "")
+    sell.setdefault("payment_details", "")
+    sell.setdefault("required_channels", [])
+    if not isinstance(sell.get("required_channels"), list):
+        sell["required_channels"] = []
+    sell["required_channels"] = [x for x in sell["required_channels"][:200] if isinstance(x, (str, dict))]
+    sell.setdefault("welcome_text", "سلام 👋\nبرای مشاهده پلن‌ها از دکمه‌های زیر استفاده کنید.")
+    sell.setdefault("last_update_at", "")
+    sell.setdefault("last_error", "")
+    sell.setdefault("offset", 0)
+    sell.setdefault("plans", [])
+    sell.setdefault("customer_users", {})
+
+    # One-time migration from the old single-plan schema.
+    plans_raw = sell.get("plans", None)
+    plans_missing = not isinstance(plans_raw, list)
+    if plans_missing:
+        plans = []
+        sell["plans"] = plans
+    else:
+        plans = plans_raw
+    # Legacy single-plan migration is allowed only when the old key did not exist.
+    # An intentionally empty plan list must remain empty so the final plan can be deleted.
+    if plans_missing and any(str(sell.get(k) or "").strip() for k in ("plan_name", "price")):
+        plans.append({
+            "id": "pln_" + secrets.token_hex(4),
+            "name": str(sell.get("plan_name") or "1 ماهه").strip()[:80],
+            "price": str(sell.get("price") or "توافقی").strip()[:80],
+            "traffic_gb": max(0.0, float(sell.get("traffic_gb") or 0)),
+            "expire_days": max(0, int(sell.get("expire_days") or 0)),
+            "inbound_id": str(sell.get("inbound_id") or _bot_default_inbound_id()).strip(),
+            "username_prefix": "shop",
+            "enabled": True,
+            "created_at": datetime.now().isoformat(),
+        })
+    # Backward-compatible display fields.
+    if plans:
+        first = plans[0]
+        sell["plan_name"] = first.get("name") or "1 ماهه"
+        sell["price"] = first.get("price") or ""
+        sell["traffic_gb"] = first.get("traffic_gb") or 0
+        sell["expire_days"] = first.get("expire_days") or 0
+    return cfg
+
+
+def _mask_bot_token(token: str) -> str:
+    token = str(token or "")
+    if len(token) <= 10:
+        return "••••••••" if token else ""
+    return token[:6] + "••••••••" + token[-4:]
+
+
+def _normalize_tg_channel(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Channel link / @username is required")
+    if re.fullmatch(r"-?\d{5,}", raw):
+        return raw, "", raw
+    if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", raw):
+        username = raw[1:]
+        return raw, f"https://t.me/{username}", f"@{username}"
+    m = re.match(r"^https?://(?:www\.)?t\.me/([^/?#]+)", raw, re.I)
+    if m:
+        slug = m.group(1)
+        if slug.startswith("+"):
+            return raw, raw, raw
+        if slug.lower().startswith("c/"):
+            return raw, raw, raw
+        username = slug.lstrip("@").strip()
+        if re.fullmatch(r"[A-Za-z0-9_]{4,}", username):
+            return f"@{username}", f"https://t.me/{username}", f"@{username}"
+    raise ValueError("Use @channelusername, https://t.me/channelusername, or the numeric chat id")
+
+
+async def _telegram_api(token: str, method: str, data: dict | None = None, files=None, timeout: float = 20.0):
+    token = str(token or "").strip()
+    if not token:
+        raise ValueError("Telegram Bot API key is not configured")
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    client = http_client
+    own = client is None
+    if own:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=8.0), follow_redirects=True)
+    try:
+        if files is not None:
+            resp = await client.post(url, data=data or {}, files=files, timeout=timeout)
+        else:
+            resp = await client.post(url, json=data or {}, timeout=timeout)
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"ok": False, "description": resp.text[:500]}
+        if resp.status_code >= 400 or not payload.get("ok"):
+            raise RuntimeError(str(payload.get("description") or f"Telegram HTTP {resp.status_code}"))
+        return payload.get("result")
+    finally:
+        if own:
+            await client.aclose()
+
+
+async def _telegram_send_message(token: str, chat_id, text_value: str, parse_mode: str | None = "HTML", reply_markup=None):
+    data = {"chat_id": chat_id, "text": text_value, "disable_web_page_preview": False}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+    return await _telegram_api(token, "sendMessage", data=data, timeout=20)
+
+
+async def _telegram_send_photo(token: str, chat_id, png_bytes: bytes, caption: str, reply_markup=None):
+    files = {"photo": ("subscription-qr.png", png_bytes, "image/png")}
+    data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    return await _telegram_api(token, "sendPhoto", data=data, files=files, timeout=30)
+
+
+async def _telegram_send_photo_id(token: str, chat_id, file_id: str, caption: str, reply_markup=None):
+    data = {"chat_id": chat_id, "photo": file_id, "caption": caption, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+    return await _telegram_api(token, "sendPhoto", data=data, timeout=30)
+
+
+async def _telegram_send_document_id(token: str, chat_id, file_id: str, caption: str, reply_markup=None):
+    data = {"chat_id": chat_id, "document": file_id, "caption": caption, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+    return await _telegram_api(token, "sendDocument", data=data, timeout=30)
+
+
+async def _telegram_answer_callback(token: str, callback_id: str, text_value: str = "", show_alert: bool = False):
+    data = {"callback_query_id": callback_id}
+    if text_value:
+        data["text"] = text_value[:180]
+    data["show_alert"] = bool(show_alert)
+    return await _telegram_api(token, "answerCallbackQuery", data=data, timeout=10)
+
+
+async def _telegram_edit_message_reply_markup(token: str, chat_id, message_id: int, reply_markup=None):
+    data = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup or {"inline_keyboard": []}}
+    return await _telegram_api(token, "editMessageReplyMarkup", data=data, timeout=10)
+
+
+async def _telegram_edit_message_caption(token: str, chat_id, message_id: int, caption: str):
+    return await _telegram_api(token, "editMessageCaption", data={
+        "chat_id": chat_id, "message_id": message_id, "caption": caption, "parse_mode": "HTML"
+    }, timeout=10)
+
+
+def _bot_public_subscription_url(config_uuid: str) -> str:
+    host = str(SETTINGS.get("domain") or get_host() or "").strip()
+    host = re.sub(r"^https?://", "", host, flags=re.I).rstrip("/")
+    if not host or host in {"localhost", "127.0.0.1", "0.0.0.0"} or re.match(r"^(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?$", host, re.I):
+        raise ValueError("Panel public domain is not ready yet")
+    return f"https://{host}/link/{config_uuid}"
+
+
+def _subscription_qr_bytes(sub_url: str) -> bytes:
+    if not QR_AVAILABLE:
+        raise RuntimeError("QR generator is unavailable")
+    qr = qrcode.QRCode(version=1, box_size=8, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(sub_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _bot_default_inbound_id() -> str:
+    preferred = find_default_tls_ws_inbound_id()
+    if preferred and preferred in INBOUNDS:
+        return str(preferred)
+    for iid, ib in INBOUNDS.items():
+        if iid == "Node" or bool(ib.get("system")):
+            continue
+        if str(ib.get("protocol") or "").lower() != "telegram":
+            return str(iid)
+    return ""
+
+
+async def _create_bot_user(body: dict) -> dict:
+    """Use the normal authenticated create-user route so existing sync logic stays centralized."""
+    token = await create_session()
+    try:
+        client = http_client
+        own = client is None
+        if own:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0), follow_redirects=True)
+        try:
+            r = await client.post(
+                "http://127.0.0.1:8080/api/users",
+                json=body,
+                cookies={SESSION_COOKIE: token},
+                headers={"X-Spider-Bot": "1"},
+                timeout=30.0,
+            )
+        finally:
+            if own:
+                await client.aclose()
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"detail": r.text[:500]}
+        if r.status_code >= 400:
+            raise RuntimeError(str(payload.get("detail") or payload.get("error") or f"create user failed ({r.status_code})"))
+        return payload
+    finally:
+        await destroy_session(token)
+
+
+async def _delete_bot_user(user_id: str) -> None:
+    token = await create_session()
+    try:
+        client = http_client
+        own = client is None
+        if own:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0), follow_redirects=True)
+        try:
+            r = await client.delete(
+                f"http://127.0.0.1:8080/api/users/{quote(str(user_id), safe='')}",
+                cookies={SESSION_COOKIE: token},
+                headers={"X-Spider-Bot": "1"},
+                timeout=30.0,
+            )
+        finally:
+            if own:
+                await client.aclose()
+        if r.status_code not in (200, 404):
+            try:
+                payload = r.json()
+            except Exception:
+                payload = {}
+            raise RuntimeError(str(payload.get("detail") or f"delete user failed ({r.status_code})"))
+    finally:
+        await destroy_session(token)
+
+
+def _make_bot_username(prefix: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", str(prefix or "spider")).strip("-_")[:18] or "spider"
+    return f"{safe}-{datetime.now().strftime('%m%d%H%M%S')}-{secrets.token_hex(2)}"[:40]
+
+
+def _html_tag_link(label: str, url: str) -> str:
+    import html as _html
+    return f'<a href="{_html.escape(url, quote=True)}">{_html.escape(label or url)}</a>'
+
+
+def _sell_plans() -> list[dict]:
+    sell = _bot_cfg().get("sell") or {}
+    plans = sell.get("plans") or []
+    return [p for p in plans if isinstance(p, dict) and bool(p.get("enabled", True))]
+
+
+def _find_sell_plan(plan_id: str) -> dict | None:
+    pid = str(plan_id or "").strip()
+    for plan in _sell_plans():
+        if str(plan.get("id") or "") == pid:
+            return dict(plan)
+    return None
+
+
+def _validate_admin_id(value: str) -> str:
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"\d{1,20}", raw):
+        raise ValueError("Admin ID must be the numeric Telegram user ID")
+    n = int(raw)
+    if n <= 0 or n > 2**63 - 1:
+        raise ValueError("Admin ID is out of range")
+    return raw
+
+
+def _normalize_plan_input(data: dict, existing: dict | None = None) -> dict:
+    old = existing or {}
+    name = str(data.get("name", old.get("name") or "")).strip()[:80]
+    if not name:
+        raise ValueError("Plan name is required")
+    price = str(data.get("price", old.get("price") or "")).strip()[:80]
+    if not price:
+        raise ValueError("Plan price is required")
+    traffic_gb = float(data.get("traffic_gb", old.get("traffic_gb") or 0) or 0)
+    expire_days = int(data.get("expire_days", old.get("expire_days") or 0) or 0)
+    inbound_id = str(data.get("inbound_id", old.get("inbound_id") or "")).strip()
+    if not inbound_id:
+        inbound_id = _bot_default_inbound_id()
+    if not inbound_id or inbound_id not in INBOUNDS:
+        raise ValueError("Select a valid inbound for this plan")
+    if traffic_gb < 0 or traffic_gb > 10**6:
+        raise ValueError("Traffic is invalid")
+    if expire_days < 0 or expire_days > 36500:
+        raise ValueError("Time is invalid")
+    prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", str(data.get("username_prefix", old.get("username_prefix") or "shop"))).strip("-_")[:24] or "shop"
+    return {
+        "id": str(old.get("id") or "pln_" + secrets.token_hex(4)),
+        "name": name,
+        "price": price,
+        "traffic_gb": round(traffic_gb, 3),
+        "expire_days": expire_days,
+        "inbound_id": inbound_id,
+        "username_prefix": prefix,
+        "enabled": bool(data.get("enabled", old.get("enabled", True))),
+        "created_at": str(old.get("created_at") or datetime.now().isoformat()),
+        "updated_at": datetime.now().isoformat(),
+    }
+
+
+async def _channel_bot_delete_pending(ch: dict) -> None:
+    pending = [str(x) for x in (ch.get("pending_delete_user_ids") or []) if str(x).strip()]
+    if not pending:
+        ch["last_delete_error"] = ""
+        return
+    remaining = []
+    errors = []
+    for uid in pending:
+        try:
+            await _delete_bot_user(uid)
+        except Exception as e:
+            remaining.append(uid)
+            errors.append(str(e)[:150])
+    ch["pending_delete_user_ids"] = remaining[-20:]
+    ch["last_delete_error"] = "; ".join(errors)[:400]
+
+
+async def _channel_bot_run_once() -> dict:
+    cfg = _bot_cfg()
+    token = str(cfg.get("token") or "").strip()
+    ch = cfg.get("channel") or {}
+    channel_input = str(ch.get("channel") or "").strip()
+    if not token:
+        raise RuntimeError("Telegram Bot API key is not configured")
+    chat_id, channel_url, channel_label = _normalize_tg_channel(channel_input)
+    chat = None
+    if str(chat_id).startswith("@") or re.fullmatch(r"-?\d{5,}", str(chat_id)):
+        chat = await _telegram_api(token, "getChat", data={"chat_id": chat_id}, timeout=15)
+    if chat and str(chat.get("type") or "") != "channel":
+        raise RuntimeError("The configured chat is not a Telegram channel")
+    if chat:
+        username = str(chat.get("username") or "").strip()
+        title = str(chat.get("title") or chat.get("username") or channel_label or "Channel").strip()
+        if username:
+            channel_url = f"https://t.me/{username}"
+            channel_label = f"@{username}"
+        else:
+            channel_label = title
+    if not channel_url:
+        channel_url = channel_input
+    inbound_id = str(ch.get("inbound_id") or _bot_default_inbound_id()).strip()
+    body = {
+        "username": _make_bot_username(ch.get("username_prefix") or "spider"),
+        "traffic_limit_gb": max(0.0, float(ch.get("traffic_limit_gb") or 0)),
+        "expire_days": max(0, int(ch.get("expire_days") or 0)),
+        "inbound_id": inbound_id or None,
+        "inbound_ids": [inbound_id] if inbound_id else [],
+        "protocol": "vless",
+        "transport_type": "ws",
+        "server": "Telegram Channel Bot",
+    }
+    user = await _create_bot_user(body)
+    config_uuid = str(user.get("config_uuid") or "").strip()
+    username = str(user.get("username") or body["username"]).strip()
+    sub_url = str(user.get("subscription_url") or "").strip() or _bot_public_subscription_url(config_uuid)
+    qr_png = _subscription_qr_bytes(sub_url)
+    channel_link = _html_tag_link(channel_label or "Channel", channel_url)
+    caption = (
+        f"<b>🕷 SpiderPanel</b>\n"
+        f"👤 <code>{username}</code>\n"
+        f"🔗 {_html_tag_link('لینک ساب', sub_url)}\n"
+        f"📣 {channel_link}"
+    )
+    try:
+        sent = await _telegram_send_photo(token, chat_id, qr_png, caption)
+    except Exception:
+        # Do not leak an unpublished channel user.
+        try:
+            await _delete_bot_user(str(user.get("user_id") or ""))
+        except Exception:
+            pass
+        raise
+
+    previous_user_id = str(ch.get("last_user_id") or "").strip()
+    if bool(ch.get("replace_previous", True)) and previous_user_id and previous_user_id != str(user.get("user_id") or ""):
+        pending = [str(x) for x in (ch.get("pending_delete_user_ids") or []) if str(x).strip()]
+        if previous_user_id not in pending:
+            pending.append(previous_user_id)
+        ch["pending_delete_user_ids"] = pending[-20:]
+        await _channel_bot_delete_pending(ch)
+
+    ch["last_run_at"] = datetime.now().isoformat()
+    ch["last_user_id"] = str(user.get("user_id") or "")
+    ch["last_message_id"] = int((sent or {}).get("message_id") or 0)
+    ch["success_count"] = int(ch.get("success_count") or 0) + 1
+    ch["last_error"] = ""
+    interval = max(1, min(int(ch.get("interval_minutes") or 60), 10080))
+    ch["next_run_at"] = (datetime.now() + timedelta(minutes=interval)).isoformat()
+    asyncio.create_task(save_state())
+    log_activity("bot", f"Channel Bot: کاربر «{username}» ساخته و به کانال ارسال شد", "ok")
+    return {"ok": True, "user": user, "subscription_url": sub_url, "message_id": ch["last_message_id"]}
+
+
+async def _channel_bot_loop():
+    while True:
+        try:
+            cfg = _bot_cfg()
+            ch = cfg.get("channel") or {}
+            if not bool(ch.get("enabled")) or not str(cfg.get("token") or "").strip() or not str(ch.get("channel") or "").strip():
+                ch["next_run_at"] = ""
+                try:
+                    await asyncio.wait_for(BOT_WAKE.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    continue
+                BOT_WAKE.clear()
+                continue
+            # Retry any previous user deletions before/alongside scheduled work.
+            try:
+                await _channel_bot_delete_pending(ch)
+            except Exception as e:
+                ch["last_delete_error"] = str(e)[:400]
+            interval = max(1, min(int(ch.get("interval_minutes") or 60), 10080))
+            next_run = 0.0
+            if ch.get("next_run_at"):
+                try:
+                    next_run = datetime.fromisoformat(str(ch["next_run_at"])).timestamp()
+                except Exception:
+                    next_run = 0.0
+            if next_run <= 0:
+                ch["next_run_at"] = (datetime.now() + timedelta(minutes=interval)).isoformat()
+                asyncio.create_task(save_state())
+                next_run = time.time() + interval * 60
+            delay = max(0.5, next_run - time.time())
+            try:
+                await asyncio.wait_for(BOT_WAKE.wait(), timeout=delay)
+                BOT_WAKE.clear()
+                continue
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await _channel_bot_run_once()
+            except Exception as e:
+                ch["error_count"] = int(ch.get("error_count") or 0) + 1
+                ch["last_error"] = str(e)[:400]
+                ch["next_run_at"] = (datetime.now() + timedelta(minutes=min(interval, 30))).isoformat()
+                asyncio.create_task(save_state())
+                logger.warning("Channel Bot run failed: %s", e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Channel Bot scheduler error: %s", e)
+            await asyncio.sleep(5)
+
+
+
+async def _sell_bot_reset_customer_ui(token: str, chat_id) -> None:
+    """Clear the last customer inline keyboard so every new command starts clean."""
+    cid = str(chat_id)
+    async with BOT_CUSTOMER_UI_LOCK:
+        state = dict(BOT_CUSTOMER_UI.get(cid) or {})
+        BOT_CUSTOMER_UI.pop(cid, None)
+    mid = int(state.get("menu_message_id") or 0)
+    if mid:
+        try:
+            await _telegram_edit_message_reply_markup(token, chat_id, mid, {"inline_keyboard": []})
+        except Exception:
+            pass
+
+
+async def _sell_bot_track_customer_message(chat_id, result, section: str = "menu") -> dict:
+    """Track only the latest navigational message for this customer."""
+    mid = int((result or {}).get("message_id") or 0)
+    if mid:
+        async with BOT_CUSTOMER_UI_LOCK:
+            BOT_CUSTOMER_UI[str(chat_id)] = {
+                "menu_message_id": mid,
+                "section": str(section or "menu"),
+                "updated_at": datetime.now().isoformat(),
+            }
+    return result or {}
+
+
+def _sell_main_menu_markup():
+    # Keep the customer home screen intentionally small: the three requested sections.
+    return {"inline_keyboard": [
+        [{"text": "🟢 اعتبار من", "callback_data": "sell:account"},
+         {"text": "🛍 محصولات", "callback_data": "sell:products"}],
+        [{"text": "💬 پشتیبانی", "callback_data": "sell:support"}],
+    ]}
+
+
+async def _sell_bot_send_main_menu(token: str, chat_id, welcome: str | None = None):
+    text = str(welcome or "🕷 <b>SpiderPanel Shop</b>\n\nیکی از بخش‌های زیر را انتخاب کنید:")
+    sent = await _telegram_send_message(token, chat_id, text, reply_markup=_sell_main_menu_markup())
+    return await _sell_bot_track_customer_message(chat_id, sent, "menu")
+
+
+def _normalize_required_channel(item) -> dict:
+    import html as _html
+    if isinstance(item, dict):
+        chat_id = str(item.get("chat_id") or item.get("id") or item.get("channel") or "").strip()
+        join_url = str(item.get("join_url") or item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()[:80]
+    else:
+        chat_id = str(item or "").strip()
+        join_url = ""
+        title = ""
+    if not chat_id:
+        raise ValueError("شناسه یا @username کانال الزامی است")
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,}", chat_id):
+        username = chat_id[1:]
+        join_url = join_url or f"https://t.me/{username}"
+        title = title or f"@{username}"
+    elif re.fullmatch(r"-?\d{5,}", chat_id):
+        title = title or chat_id
+        if not join_url:
+            raise ValueError("برای کانال عددی، Join Link الزامی است")
+    else:
+        m = re.match(r"^https?://(?:www\.)?t\.me/([^/?#]+)$", chat_id, re.I)
+        if m and not m.group(1).startswith(("+", "c/")):
+            username = m.group(1).lstrip("@")
+            if re.fullmatch(r"[A-Za-z0-9_]{4,}", username):
+                chat_id = "@" + username
+                join_url = join_url or f"https://t.me/{username}"
+                title = title or chat_id
+        if not chat_id.startswith("@") and not re.fullmatch(r"-?\d{5,}", chat_id):
+            raise ValueError("Channel باید @username یا Numeric Chat ID باشد")
+    if join_url and not re.match(r"^https?://t\.me/", join_url, re.I):
+        raise ValueError("Join Link باید از t.me باشد")
+    return {"chat_id": chat_id, "join_url": join_url, "title": title or chat_id}
+
+
+def _required_channels():
+    sell = _bot_cfg().get("sell") or {}
+    out = []
+    for item in sell.get("required_channels") or []:
+        try:
+            out.append(_normalize_required_channel(item))
+        except Exception:
+            continue
+    return out
+
+
+async def _sell_bot_missing_joins(token: str, user_id) -> list[dict]:
+    """Return all configured channels where the Telegram user is not a member.
+
+    Checks run concurrently with a small limit so a large required-channel list
+    does not make the customer wait serially for every Telegram API request.
+    """
+    channels = _required_channels()
+    if not channels:
+        return []
+    uid = int(user_id)
+    sem = asyncio.Semaphore(8)
+
+    async def check(channel: dict):
+        async with sem:
+            try:
+                member = await _telegram_api(
+                    token, "getChatMember",
+                    data={"chat_id": channel["chat_id"], "user_id": uid},
+                    timeout=12,
+                )
+                status = str(member.get("status") or "").lower()
+                joined = status in {"creator", "administrator", "member"} or (
+                    status == "restricted" and bool(member.get("is_member"))
+                )
+                return None if joined else channel
+            except Exception as e:
+                return {**channel, "error": str(e)[:180]}
+
+    results = await asyncio.gather(*(check(ch) for ch in channels), return_exceptions=False)
+    return [item for item in results if item]
+
+
+async def _sell_bot_require_joins(token: str, chat_id, user_id) -> bool:
+    missing = await _sell_bot_missing_joins(token, user_id)
+    if not missing:
+        return True
+    rows = []
+    for ch in missing[:200]:
+        url = ch.get("join_url") or (f"https://t.me/{ch['chat_id'][1:]}" if str(ch.get("chat_id") or "").startswith("@") else "")
+        if url:
+            rows.append([{"text": f"📢 عضویت: {str(ch.get('title') or ch.get('chat_id'))[:28]}", "url": url}])
+        else:
+            rows.append([{ "text": f"📢 {str(ch.get('title') or ch.get('chat_id'))[:28]}", "callback_data": "sell:join:noop" }])
+    rows.append([{"text": "✅ بررسی عضویت", "callback_data": "sell:join:check"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "sell:menu"}])
+    msg = "🔒 <b>عضویت اجباری</b>\n\nبرای استفاده از فروشگاه، ابتدا در کانال‌های زیر عضو شوید. سپس «بررسی عضویت» را بزنید."
+    await _telegram_send_message(token, chat_id, msg, reply_markup={"inline_keyboard": rows})
+    return False
+
+
+async def _sell_bot_get_customer_user(chat_id):
+    sell = _bot_cfg().get("sell") or {}
+    key = str(chat_id)
+    uid = str((sell.get("customer_users") or {}).get(key) or "").strip()
+    async with USERS_LOCK:
+        user = dict(USERS.get(uid) or {}) if uid else None
+    if user is None:
+        return None
+    exp = str(user.get("expire_at") or "").strip()
+    expired = False
+    if exp:
+        try:
+            expired = datetime.now() >= datetime.fromisoformat(exp)
+        except Exception:
+            expired = False
+    if expired or user.get("status") == "expired":
+        try:
+            await _delete_bot_user(uid)
+        except Exception as e:
+            logger.warning("Sell customer expired account delete failed uid=%s: %s", uid, e)
+            return "expired_pending"
+        sell.setdefault("customer_users", {}).pop(key, None)
+        asyncio.create_task(save_state())
+        return "expired"
+    return user
+
+
+async def _sell_bot_send_account(token: str, chat_id):
+    result = await _sell_bot_get_customer_user(chat_id)
+    if result == "expired":
+        await _telegram_send_message(token, chat_id, "⛔ <b>اعتبار شما تمام شده است.</b>\nاکانت شما از پنل حذف شد. برای خرید مجدد به بخش «محصولات» بروید.", reply_markup=_sell_main_menu_markup())
+        return
+    if result == "expired_pending":
+        await _telegram_send_message(token, chat_id, "⛔ <b>اعتبار شما تمام شده است.</b>\nحساب منقضی شده و حذف آن در حال انجام است؛ لطفاً چند لحظه بعد دوباره بررسی کنید.", reply_markup=_sell_main_menu_markup())
+        return
+    if not result:
+        await _sell_bot_send_main_menu(token, chat_id, "ℹ️ <b>اعتبار من</b>\n\nهنوز اشتراک فعالی برای این حساب ثبت نشده است.")
+        return
+    user = dict(result)
+    traffic_limit = int(user.get("traffic_limit_bytes") or 0)
+    traffic_used = int(user.get("traffic_used_bytes") or 0)
+    if traffic_limit <= 0:
+        traffic_text = "نامحدود"
+        remain_text = "نامحدود"
+    else:
+        remain = max(0, traffic_limit - traffic_used)
+        traffic_text = fmt_bytes(traffic_limit)
+        remain_text = fmt_bytes(remain)
+    exp = str(user.get("expire_at") or "").strip()
+    if exp:
+        try:
+            dt = datetime.fromisoformat(exp)
+            remain_days = max(0, (dt - datetime.now()).total_seconds()/86400)
+            expiry_text = f"{dt.strftime('%Y-%m-%d %H:%M')} · {remain_days:.1f} روز باقی‌مانده"
+        except Exception:
+            expiry_text = exp
+    else:
+        expiry_text = "نامحدود"
+    text_value = (
+        "🟢 <b>اعتبار من</b>\n\n"
+        f"🆔 Telegram ID: <code>{chat_id}</code>\n"
+        f"👤 نام کاربر پنل: <code>{user.get('username') or '—'}</code>\n"
+        f"🟢 وضعیت: <b>{'فعال' if is_user_allowed(user) else 'غیرفعال'}</b>\n"
+        f"💾 مصرف: <b>{fmt_bytes(traffic_used)}</b> / <b>{traffic_text}</b>\n"
+        f"📉 مانده: <b>{remain_text}</b>\n"
+        f"⏳ اعتبار: <b>{expiry_text}</b>"
+    )
+    sub_url = str(user.get("subscription_url") or "").strip()
+    if not sub_url and user.get("config_uuid"):
+        try:
+            sub_url = _bot_public_subscription_url(str(user.get("config_uuid")))
+        except Exception:
+            sub_url = ""
+    markup_rows = []
+    if sub_url:
+        markup_rows.append([{ "text": "🔗 لینک اشتراک", "url": sub_url }])
+    markup_rows.append([{ "text": "🛍 محصولات", "callback_data": "sell:products" }, {"text": "💬 پشتیبانی", "callback_data": "sell:support"}])
+    markup_rows.append([{ "text": "🏠 منوی اصلی", "callback_data": "sell:menu" }])
+    if QR_AVAILABLE and sub_url:
+        try:
+            qr = _subscription_qr_bytes(sub_url)
+            sent = await _telegram_send_photo(token, chat_id, qr, text_value, reply_markup={"inline_keyboard": markup_rows})
+            await _sell_bot_track_customer_message(chat_id, sent, "account")
+            return
+        except Exception:
+            pass
+    sent = await _telegram_send_message(token, chat_id, text_value, reply_markup={"inline_keyboard": markup_rows})
+    await _sell_bot_track_customer_message(chat_id, sent, "account")
+
+
+async def _sell_bot_send_support(token: str, chat_id):
+    sell = _bot_cfg().get("sell") or {}
+    support = str(sell.get("support_username") or "").strip()
+    text_value = str(sell.get("support_text") or "💬 برای پشتیبانی با مدیر فروش تماس بگیرید.").strip()
+    rows = []
+    if support:
+        if support.startswith("https://t.me/"):
+            url = support
+            label = support.rsplit("/",1)[-1]
+        else:
+            label = support.lstrip("@")
+            url = f"https://t.me/{label}"
+        rows.append([{ "text": "💬 تماس با پشتیبانی", "url": url }])
+    rows.append([{ "text": "🏠 منوی اصلی", "callback_data": "sell:menu" }])
+    sent = await _telegram_send_message(token, chat_id, text_value, reply_markup={"inline_keyboard": rows})
+    await _sell_bot_track_customer_message(chat_id, sent, "support")
+
+
+async def _sell_bot_send_plans(token: str, chat_id):
+    sell = _bot_cfg().get("sell") or {}
+    plans = _sell_plans()
+    if not plans:
+        sent = await _telegram_send_message(token, chat_id, "🛍 <b>محصولات</b>\n\nفعلاً هیچ Plan فعالی برای فروش وجود ندارد.", reply_markup={"inline_keyboard": [[{"text": "🏠 منوی اصلی", "callback_data": "sell:menu"}]]})
+        return await _sell_bot_track_customer_message(chat_id, sent, "products")
+    rows = []
+    keyboard = []
+    for plan in plans[:30]:
+        traffic = float(plan.get("traffic_gb") or 0)
+        days = int(plan.get("expire_days") or 0)
+        traffic_text = "نامحدود" if traffic <= 0 else f"{traffic:g} GB"
+        days_text = "نامحدود" if days <= 0 else f"{days} روز"
+        inbound_name = str((INBOUNDS.get(str(plan.get("inbound_id") or "")) or {}).get("name") or plan.get("inbound_id") or "Default")
+        rows.append(
+            f"📦 <b>{plan.get('name')}</b>\n"
+            f"💾 {traffic_text} · ⏳ {days_text}\n"
+            f"🌐 {inbound_name}\n"
+            f"💰 <b>{plan.get('price')}</b>"
+        )
+        keyboard.append([{"text": f"💳 خرید {str(plan.get('name') or '')[:28]}", "callback_data": f"sell:plan:{plan.get('id')}"}])
+    keyboard.append([{ "text": "🟢 اعتبار من", "callback_data": "sell:account" }, {"text": "💬 پشتیبانی", "callback_data": "sell:support"}])
+    keyboard.append([{ "text": "🏠 منوی اصلی", "callback_data": "sell:menu" }])
+    text_value = "🛍 <b>محصولات</b>\n\n" + "\n\n".join(rows)
+    payment = str(sell.get("payment_details") or "").strip()
+    payment_url = str(sell.get("payment_url") or "").strip()
+    if payment:
+        text_value += f"\n\n💳 <b>روش پرداخت</b>\n{payment}"
+    if payment_url:
+        text_value += f"\n🔗 <a href=\"{payment_url}\">لینک پرداخت</a>"
+    sent = await _telegram_send_message(token, chat_id, text_value, reply_markup={"inline_keyboard": keyboard})
+    return await _sell_bot_track_customer_message(chat_id, sent, "products")
+
+
+def _sell_admin_menu_markup():
+    return {"inline_keyboard": [
+        [{"text": "➕ افزودن Plan", "callback_data": "sell:admin:add"}],
+        [{"text": "📦 مدیریت Planها", "callback_data": "sell:admin:plans"}],
+        [{"text": "🧾 سفارش‌های در انتظار", "callback_data": "sell:admin:pending"}],
+        [{"text": "❌ بستن", "callback_data": "sell:admin:close"}],
+    ]}
+
+
+def _sell_admin_format_plan(plan: dict) -> str:
+    traffic = float(plan.get("traffic_gb") or 0)
+    days = int(plan.get("expire_days") or 0)
+    return (
+        f"📦 <b>{plan.get('name') or 'بدون نام'}</b>\n"
+        f"💰 {plan.get('price') or '—'}\n"
+        f"💾 {'نامحدود' if traffic <= 0 else f'{traffic:g} GB'} · "
+        f"⏳ {'نامحدود' if days <= 0 else f'{days} روز'}\n"
+        f"🌐 <code>{plan.get('inbound_id') or '—'}</code> · 👤 <code>{plan.get('username_prefix') or 'shop'}</code>"
+    )
+
+
+async def _sell_bot_admin_plans(token: str, chat_id):
+    sell = _bot_cfg().get("sell") or {}
+    plans = [p for p in (sell.get("plans") or []) if isinstance(p, dict)]
+    if not plans:
+        return await _telegram_send_message(
+            token, chat_id, "📦 هنوز هیچ Planای ساخته نشده است.",
+            reply_markup={"inline_keyboard": [[{"text": "➕ افزودن Plan", "callback_data": "sell:admin:add"}], [{"text": "↩️ منوی مدیریت", "callback_data": "sell:admin:menu"}]]}
+        )
+    await _telegram_send_message(token, chat_id, "📦 <b>مدیریت Planها</b>")
+    for plan in plans[:30]:
+        pid = str(plan.get("id") or "")
+        enabled = bool(plan.get("enabled", True))
+        toggle_text = "⏸ غیرفعال" if enabled else "▶️ فعال"
+        toggle_value = "0" if enabled else "1"
+        markup = {"inline_keyboard": [[
+            {"text": "✏️ ویرایش", "callback_data": f"sell:admin:edit:{pid}"},
+            {"text": toggle_text, "callback_data": f"sell:admin:toggle:{pid}:{toggle_value}"},
+            {"text": "🗑 حذف", "callback_data": f"sell:admin:delete:{pid}"},
+        ] ]}
+        await _telegram_send_message(token, chat_id, _sell_admin_format_plan(plan), reply_markup=markup)
+    await _telegram_send_message(token, chat_id, "⚙️ مدیریت", reply_markup={"inline_keyboard": [[{"text": "➕ افزودن Plan", "callback_data": "sell:admin:add"}, {"text": "↩️ بازگشت", "callback_data": "sell:admin:menu"}]]})
+
+
+async def _sell_bot_admin_start_wizard(token: str, admin_id: str, mode: str = "add", existing: dict | None = None):
+    plan = dict(existing or {})
+    if not plan:
+        plan = {"enabled": True, "username_prefix": "shop"}
+    async with BOT_ADMIN_WIZARD_LOCK:
+        BOT_ADMIN_WIZARD[str(admin_id)] = {
+            "mode": mode,
+            "step": "name",
+            "plan": plan,
+            "started_at": datetime.now().isoformat(),
+        }
+    title = "افزودن Plan" if mode == "add" else "ویرایش Plan"
+    prompt = f"⚙️ <b>{title}</b>\n\n✏️ <b>مرحله ۱/۶</b>\nاسم Plan را ارسال کنید."
+    if existing:
+        prompt += f"\nمقدار فعلی: <code>{existing.get('name') or '—'}</code>"
+    prompt += "\n\nبرای لغو /cancel را بفرستید."
+    await _telegram_send_message(token, admin_id, prompt, reply_markup={"inline_keyboard": [[{"text": "❌ لغو", "callback_data": "sell:wiz:cancel"}]]})
+
+
+def _sell_admin_inbound_markup():
+    rows = []
+    for iid, ib in list(INBOUNDS.items()):
+        if iid == "Node" or bool(ib.get("system")):
+            continue
+        label = str(ib.get("name") or iid)[:36]
+        rows.append([{"text": f"🌐 {label}", "callback_data": f"sell:wiz:inbound:{str(iid)[:35]}"}])
+    if not rows:
+        rows = [[{"text": "❌ هیچ Inboundای موجود نیست", "callback_data": "sell:wiz:cancel"}]]
+    rows.append([{"text": "❌ لغو", "callback_data": "sell:wiz:cancel"}])
+    return {"inline_keyboard": rows[:50]}
+
+
+def _sell_admin_traffic_markup():
+    vals = [("10 GB", 10), ("30 GB", 30), ("50 GB", 50), ("100 GB", 100), ("200 GB", 200), ("500 GB", 500), ("♾ نامحدود", 0), ("✏️ مقدار دلخواه", "custom")]
+    rows = []
+    for i in range(0, len(vals), 2):
+        rows.append([{"text": label, "callback_data": f"sell:wiz:traffic:{value}"} for label, value in vals[i:i+2]])
+    rows.append([{"text": "❌ لغو", "callback_data": "sell:wiz:cancel"}])
+    return {"inline_keyboard": rows}
+
+
+def _sell_admin_days_markup():
+    vals = [("7 روز", 7), ("30 روز", 30), ("60 روز", 60), ("90 روز", 90), ("180 روز", 180), ("365 روز", 365), ("♾ نامحدود", 0), ("✏️ مقدار دلخواه", "custom")]
+    rows = []
+    for i in range(0, len(vals), 2):
+        rows.append([{"text": label, "callback_data": f"sell:wiz:days:{value}"} for label, value in vals[i:i+2]])
+    rows.append([{"text": "❌ لغو", "callback_data": "sell:wiz:cancel"}])
+    return {"inline_keyboard": rows}
+
+
+async def _sell_bot_admin_handle_text(token: str, msg: dict) -> bool:
+    from_user = msg.get("from") or {}
+    admin_id = str(from_user.get("id") or "")
+    sell = _bot_cfg().get("sell") or {}
+    if not admin_id or admin_id != str(sell.get("admin_chat_id") or "").strip():
+        return False
+    if str((msg.get("chat") or {}).get("type") or "") != "private":
+        return False
+    text_value = str(msg.get("text") or "").strip()
+    if not text_value:
+        return False
+    async with BOT_ADMIN_WIZARD_LOCK:
+        state = dict(BOT_ADMIN_WIZARD.get(admin_id) or {})
+    if not state:
+        return False
+    if text_value.lower() in {"/cancel", "cancel", "لغو"}:
+        async with BOT_ADMIN_WIZARD_LOCK:
+            BOT_ADMIN_WIZARD.pop(admin_id, None)
+        await _telegram_send_message(token, msg.get("chat", {}).get("id") or admin_id, "✅ عملیات Plan لغو شد.", reply_markup=_sell_admin_menu_markup())
+        return True
+
+    step = str(state.get("step") or "")
+    plan = dict(state.get("plan") or {})
+    chat_id = msg.get("chat", {}).get("id") or admin_id
+    try:
+        if step == "name":
+            if not 1 <= len(text_value) <= 80:
+                raise ValueError("اسم Plan باید بین ۱ تا ۸۰ کاراکتر باشد")
+            plan["name"] = text_value
+            state["step"] = "price"
+            state["plan"] = plan
+            await _telegram_send_message(token, chat_id, "✏️ <b>مرحله ۲/۶</b>\nقیمت Plan را ارسال کنید.\nمثلاً: <code>250000 تومان</code>")
+        elif step == "price":
+            if not 1 <= len(text_value) <= 80:
+                raise ValueError("قیمت نامعتبر است")
+            plan["price"] = text_value
+            state["step"] = "inbound"
+            state["plan"] = plan
+            await _telegram_send_message(token, chat_id, "🌐 <b>مرحله ۳/۶</b>\nInbound این Plan را انتخاب کنید:", reply_markup=_sell_admin_inbound_markup())
+        elif step == "traffic_custom":
+            value = float(text_value.replace(",", "."))
+            if value < 0 or value > 1_000_000:
+                raise ValueError("حجم خارج از محدوده است")
+            plan["traffic_gb"] = value
+            state["step"] = "days"
+            state["plan"] = plan
+            await _telegram_send_message(token, chat_id, "⏳ <b>مرحله ۵/۶</b>\nمدت اعتبار را انتخاب کنید:", reply_markup=_sell_admin_days_markup())
+        elif step == "days_custom":
+            value = int(text_value)
+            if value < 0 or value > 36500:
+                raise ValueError("زمان خارج از محدوده است")
+            plan["expire_days"] = value
+            state["step"] = "prefix"
+            state["plan"] = plan
+            await _telegram_send_message(token, chat_id, "👤 <b>مرحله ۶/۶</b>\nپیشوند نام کاربر را ارسال کنید.\nمثلاً: <code>shop</code>")
+        elif step == "prefix":
+            prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", text_value).strip("-_")[:24]
+            if not prefix:
+                raise ValueError("پیشوند نام کاربر نامعتبر است")
+            plan["username_prefix"] = prefix
+            state["step"] = "confirm"
+            state["plan"] = plan
+            traffic = float(plan.get("traffic_gb") or 0)
+            days = int(plan.get("expire_days") or 0)
+            preview = (
+                "✅ <b>پلن آمادهٔ ذخیره است</b>\n\n" + _sell_admin_format_plan(plan) +
+                "\n\nبا دکمهٔ پایین ذخیره کنید."
+            )
+            await _telegram_send_message(token, chat_id, preview, reply_markup={"inline_keyboard": [[{"text": "✅ ذخیره Plan", "callback_data": "sell:wiz:confirm"}, {"text": "❌ لغو", "callback_data": "sell:wiz:cancel"}]]})
+        else:
+            return False
+        async with BOT_ADMIN_WIZARD_LOCK:
+            BOT_ADMIN_WIZARD[admin_id] = state
+        return True
+    except (ValueError, TypeError) as e:
+        await _telegram_send_message(token, chat_id, f"❌ {e}")
+        return True
+
+
+
+async def _find_active_sell_order(chat_id: int | str):
+    cid = str(chat_id)
+    async with BOT_ORDERS_LOCK:
+        for oid, order in BOT_ORDERS.items():
+            if str(order.get("chat_id")) == cid and str(order.get("status")) in {"awaiting_payment", "payment_submitted", "processing"}:
+                return oid, dict(order)
+    return None, None
+
+
+async def _activate_sell_order(order_id: str, admin_chat_id) -> dict:
+    order_id = str(order_id or "").strip().upper()
+    async with BOT_ORDERS_LOCK:
+        order = BOT_ORDERS.get(order_id)
+        if not order:
+            raise RuntimeError("order not found")
+        if order.get("status") == "approved":
+            raise RuntimeError("order already approved")
+        if order.get("status") == "rejected":
+            raise RuntimeError("order already rejected")
+        if order.get("status") == "processing":
+            raise RuntimeError("order is already being processed")
+        if order.get("status") != "payment_submitted" and not bool(order.get("activation_applied")):
+            raise RuntimeError("payment screenshot has not been submitted yet")
+        order["status"] = "processing"
+        plan = dict(order.get("plan_snapshot") or {})
+        chat_id = order.get("chat_id")
+        customer_name = str(order.get("customer_username") or "").strip()
+        activation_user_id = str(order.get("activation_user_id") or "").strip()
+        activation_applied = bool(order.get("activation_applied"))
+        delivery_sent = bool(order.get("delivery_sent"))
+
+    # Require a usable public panel URL before fulfilling the order.
+    _bot_public_subscription_url("health-check")
+    inbound_id = str(plan.get("inbound_id") or _bot_default_inbound_id()).strip()
+    traffic_gb = max(0.0, float(plan.get("traffic_gb") or 0))
+    expire_days = max(0, int(plan.get("expire_days") or 0))
+    username_prefix = str(plan.get("username_prefix") or "shop")
+    customer_key = str(chat_id)
+
+    try:
+        user = None
+        user_id = activation_user_id
+        # Retry path: the account was already activated but final delivery failed.
+        if user_id:
+            async with USERS_LOCK:
+                user = USERS.get(user_id)
+            if user is None:
+                # A manually deleted account makes the old activation impossible to resume safely.
+                user_id = ""
+                activation_applied = False
+
+        if not activation_applied:
+            sell = _bot_cfg().get("sell") or {}
+            customer_users = sell.setdefault("customer_users", {})
+            async with USERS_LOCK:
+                existing_id = str(customer_users.get(customer_key) or "").strip()
+                if existing_id and existing_id in USERS:
+                    user_id = existing_id
+                    user = USERS[existing_id]
+                elif not existing_id:
+                    # Recover the mapping if state was imported without the customer index.
+                    for candidate_id, candidate in USERS.items():
+                        if str(candidate.get("telegram_chat_id") or "") == customer_key:
+                            user_id = str(candidate_id)
+                            user = candidate
+                            break
+
+                if user is not None:
+                    now = datetime.now()
+                    _mapped_exp = str(user.get("expire_at") or "").strip()
+                    try:
+                        _mapped_expired = bool(_mapped_exp and now >= datetime.fromisoformat(_mapped_exp)) or user.get("status") == "expired"
+                    except Exception:
+                        _mapped_expired = user.get("status") == "expired"
+                    if _mapped_expired:
+                        user = None
+                        if existing_id:
+                            customer_users.pop(customer_key, None)
+                if user is not None:
+                    current_limit = int(user.get("traffic_limit_bytes") or 0)
+                    add_limit = int(traffic_gb * 1024**3) if traffic_gb > 0 else 0
+                    if add_limit <= 0:
+                        # An unlimited plan upgrades the account to unlimited.
+                        user["traffic_limit_bytes"] = 0
+                    elif current_limit > 0:
+                        user["traffic_limit_bytes"] = current_limit + add_limit
+                    else:
+                        # Existing unlimited users remain unlimited.
+                        user["traffic_limit_bytes"] = 0
+                    current_exp = None
+                    try:
+                        if user.get("expire_at"):
+                            current_exp = datetime.fromisoformat(str(user.get("expire_at")))
+                    except Exception:
+                        current_exp = None
+                    if expire_days <= 0 or (user.get("expire_at") in (None, "") and str(user.get("status") or "active") == "active"):
+                        # Keep an already-unlimited active account unlimited.
+                        user["expire_at"] = None
+                    else:
+                        base = current_exp if current_exp and current_exp > now else now
+                        user["expire_at"] = (base + timedelta(days=expire_days)).isoformat()
+                    if inbound_id and inbound_id in INBOUNDS:
+                        ids = [str(x) for x in (user.get("inbound_ids") or []) if str(x).strip()]
+                        if inbound_id not in ids:
+                            ids.append(inbound_id)
+                        user["inbound_ids"] = ids
+                        user["inbound_id"] = inbound_id
+                    user["status"] = "active"
+                    user["telegram_chat_id"] = customer_key
+                    user["telegram_username"] = customer_name or str(user.get("telegram_username") or "")
+                    user.setdefault("sell_plan_history", []).append({"order_id": order_id, "plan_id": plan.get("id"), "at": datetime.now().isoformat()})
+                else:
+                    user = None
+
+            if user is None:
+                body = {
+                    "username": _make_bot_username(username_prefix),
+                    "traffic_limit_gb": traffic_gb,
+                    "expire_days": expire_days,
+                    "inbound_id": inbound_id or None,
+                    "inbound_ids": [inbound_id] if inbound_id else [],
+                    "protocol": "vless",
+                    "transport_type": "ws",
+                    "server": "Sell Bot",
+                }
+                user = await _create_bot_user(body)
+                user_id = str(user.get("user_id") or "")
+                if not user_id:
+                    raise RuntimeError("created user did not return user_id")
+                async with USERS_LOCK:
+                    local = USERS.get(user_id)
+                    if local is not None:
+                        local["telegram_chat_id"] = customer_key
+                        local["telegram_username"] = customer_name
+                        local.setdefault("sell_plan_history", []).append({"order_id": order_id, "plan_id": plan.get("id"), "at": datetime.now().isoformat()})
+                        user = local
+            activation_applied = True
+            # Persist the activation marker BEFORE external delivery. This makes retry idempotent.
+            sell = _bot_cfg().get("sell") or {}
+            sell.setdefault("customer_users", {})[customer_key] = user_id
+            async with BOT_ORDERS_LOCK:
+                order = BOT_ORDERS.get(order_id)
+                if order is not None:
+                    order["activation_applied"] = True
+                    order["activation_user_id"] = user_id
+                    order["activation_at"] = datetime.now().isoformat()
+            asyncio.create_task(save_state())
+
+            # Refresh dependent services after account mutation.
+            local_user = dict(USERS.get(user_id) or user)
+            if WORKER.get("connected") and _user_uses_worker_inbound(local_user):
+                asyncio.create_task(_worker_sync_users())
+            if _selected_node_ids_for_user(local_user):
+                asyncio.create_task(_sync_user_to_selected_nodes(user_id, local_user))
+            asyncio.create_task(_xray_apply())
+        else:
+            user = dict(USERS.get(user_id) or user or {})
+
+        cfg_uuid = str(user.get("config_uuid") or "").strip()
+        sub_url = str(user.get("subscription_url") or "").strip() or _bot_public_subscription_url(cfg_uuid)
+        token = str((_bot_cfg().get("token") or "")).strip()
+
+        if not delivery_sent:
+            qr = _subscription_qr_bytes(sub_url)
+            customer_caption = (
+                f"✅ <b>پرداخت تأیید شد</b>\n"
+                f"📦 {plan.get('name')}\n"
+                f"👤 <code>{user.get('username','')}</code>\n"
+                f"🔗 {_html_tag_link('لینک ساب', sub_url)}"
+            )
+            sent_delivery = await _telegram_send_photo(token, chat_id, qr, customer_caption, reply_markup=_sell_main_menu_markup())
+            await _sell_bot_track_customer_message(chat_id, sent_delivery, "delivery")
+            delivery_sent = True
+            async with BOT_ORDERS_LOCK:
+                order = BOT_ORDERS.get(order_id)
+                if order is not None:
+                    order["delivery_sent"] = True
+                    order["delivery_at"] = datetime.now().isoformat()
+
+        async with BOT_ORDERS_LOCK:
+            order = BOT_ORDERS.get(order_id) or {}
+            order.update({
+                "status": "approved",
+                "user_id": user_id,
+                "username": str(user.get("username") or ""),
+                "approved_at": datetime.now().isoformat(),
+                "delivery_sent": bool(delivery_sent),
+            })
+        try:
+            await _telegram_send_message(token, admin_chat_id, f"✅ سفارش <code>{order_id}</code> تأیید و اکانت فعال شد: <code>{user.get('username','')}</code>")
+        except Exception as admin_notify_error:
+            logger.warning("Sell Bot admin completion notification failed: %s", admin_notify_error)
+        asyncio.create_task(save_state())
+        return {"ok": True, "user": dict(user), "subscription_url": sub_url}
+    except Exception:
+        async with BOT_ORDERS_LOCK:
+            if order_id in BOT_ORDERS and BOT_ORDERS[order_id].get("status") == "processing":
+                BOT_ORDERS[order_id]["status"] = "payment_submitted"
+        raise
+
+
+async def _sell_bot_reject_order(token: str, order_id: str, admin_chat_id):
+    order_id = str(order_id or "").strip().upper()
+    async with BOT_ORDERS_LOCK:
+        order = BOT_ORDERS.get(order_id)
+        if not order:
+            raise RuntimeError("order not found")
+        if order.get("status") == "approved":
+            raise RuntimeError("order already approved")
+        if order.get("status") == "rejected":
+            raise RuntimeError("order already rejected")
+        order["status"] = "rejected"
+        order["rejected_at"] = datetime.now().isoformat()
+        customer_id = order.get("chat_id")
+    await _telegram_send_message(token, admin_chat_id, f"✅ سفارش <code>{order_id}</code> رد شد")
+    if customer_id:
+        await _sell_bot_send_main_menu(token, customer_id, f"❌ سفارش <code>{order_id}</code> رد شد. می‌توانید دوباره از «محصولات» خرید کنید.")
+    asyncio.create_task(save_state())
+
+
+async def _sell_bot_send_payment_prompt(token: str, chat_id, order_id: str, plan: dict):
+    sell = _bot_cfg().get("sell") or {}
+    traffic = float(plan.get("traffic_gb") or 0)
+    days = int(plan.get("expire_days") or 0)
+    traffic_text = "نامحدود" if traffic <= 0 else f"{traffic:g} GB"
+    days_text = "نامحدود" if days <= 0 else f"{days} روز"
+    text_value = (
+        f"🧾 <b>سفارش {order_id}</b>\n\n"
+        f"📦 پلن: <b>{plan.get('name')}</b>\n"
+        f"💾 حجم: {traffic_text}\n"
+        f"⏳ اعتبار: {days_text}\n"
+        f"💰 مبلغ: <b>{plan.get('price')}</b>\n\n"
+    )
+    payment_details = str(sell.get("payment_details") or "").strip()
+    payment_url = str(sell.get("payment_url") or "").strip()
+    if payment_details:
+        text_value += f"💳 <b>روش پرداخت</b>\n{payment_details}\n\n"
+    if payment_url:
+        text_value += f"🔗 <a href=\"{payment_url}\">لینک پرداخت</a>\n\n"
+    text_value += "📸 بعد از پرداخت، <b>اسکرین‌شات رسید</b> را همین‌جا به صورت عکس یا فایل ارسال کنید."
+    sent = await _telegram_send_message(token, chat_id, text_value, reply_markup={"inline_keyboard": [[{"text": "❌ لغو سفارش", "callback_data": f"sell:cancel:{order_id}"}]]})
+    return await _sell_bot_track_customer_message(chat_id, sent, "payment")
+
+
+async def _sell_bot_handle_message(token: str, msg: dict):
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    sell = _bot_cfg().get("sell") or {}
+    if not bool(sell.get("enabled")):
+        return
+    from_user = msg.get("from") or {}
+    is_admin = str(from_user.get("id") or "") == str(sell.get("admin_chat_id") or "").strip()
+    text_value = str(msg.get("text") or "").strip()
+    command, _, arg = text_value.partition(" ")
+    command = command.split("@", 1)[0].lower() if command else ""
+
+    # Admin wizard consumes plain text only in the private admin chat.
+    if is_admin and str(chat.get("type") or "") == "private" and text_value and not command.startswith("/"):
+        if await _sell_bot_admin_handle_text(token, msg):
+            return
+    if is_admin and str(chat.get("type") or "") == "private" and command in {"/cancel"}:
+        if await _sell_bot_admin_handle_text(token, msg):
+            return
+
+    # Payment receipt: photo or document is forwarded to the configured admin.
+    if msg.get("photo") or msg.get("document"):
+        if str(chat.get("type") or "") != "private":
+            return
+        order_id, order = await _find_active_sell_order(chat_id)
+        if not order:
+            await _telegram_send_message(token, chat_id, "ℹ️ اول یک Plan را از /plans انتخاب کنید و سپس رسید را ارسال کنید.")
+            return
+        if order.get("status") == "payment_submitted":
+            await _telegram_send_message(token, chat_id, f"ℹ️ رسید سفارش <code>{order_id}</code> قبلاً برای ادمین ارسال شده است. لطفاً منتظر تأیید بمانید.")
+            return
+        if order.get("status") != "awaiting_payment":
+            await _telegram_send_message(token, chat_id, "ℹ️ این سفارش در حال پردازش است؛ رسید جدید ارسال نکنید.")
+            return
+        payment_file_id = ""
+        media_kind = "photo"
+        if msg.get("photo"):
+            sizes = msg.get("photo") or []
+            payment_file_id = str((sizes[-1] if sizes else {}).get("file_id") or "")
+            media_kind = "photo"
+        elif msg.get("document"):
+            payment_file_id = str((msg.get("document") or {}).get("file_id") or "")
+            media_kind = "document"
+        if not payment_file_id:
+            await _telegram_send_message(token, chat_id, "❌ فایل رسید قابل تشخیص نبود. دوباره ارسال کنید.")
+            return
+        caption = str(msg.get("caption") or "").strip()[:1000]
+        admin_id = str(sell.get("admin_chat_id") or "").strip()
+        if not admin_id:
+            await _telegram_send_message(token, chat_id, "❌ ادمین فروش هنوز تنظیم نشده است.")
+            return
+        plan = dict(order.get("plan_snapshot") or {})
+        admin_caption = (
+            f"🧾 <b>رسید پرداخت جدید</b>\n"
+            f"🆔 سفارش: <code>{order_id}</code>\n"
+            f"👤 کاربر: <code>{order.get('customer_username') or 'بدون یوزرنیم'}</code>\n"
+            f"💬 Telegram ID: <code>{order.get('telegram_user_id') or chat_id}</code>\n"
+            f"📦 Plan: <b>{plan.get('name')}</b>\n"
+            f"💰 مبلغ: <b>{plan.get('price')}</b>"
+        )
+        if caption:
+            admin_caption += f"\n📝 توضیح خریدار: {caption}"
+        markup = {"inline_keyboard": [[
+            {"text": "✅ تأیید و فعال‌سازی", "callback_data": f"sell:approve:{order_id}"},
+            {"text": "❌ رد رسید", "callback_data": f"sell:reject:{order_id}"},
+        ]]}
+        if media_kind == "photo":
+            sent = await _telegram_send_photo_id(token, admin_id, payment_file_id, admin_caption, reply_markup=markup)
+        else:
+            sent = await _telegram_send_document_id(token, admin_id, payment_file_id, admin_caption, reply_markup=markup)
+        async with BOT_ORDERS_LOCK:
+            order = BOT_ORDERS.get(order_id)
+            if order:
+                order.update({
+                    "status": "payment_submitted",
+                    "payment_file_id": payment_file_id,
+                    "payment_media_kind": media_kind,
+                    "payment_message_id": int(msg.get("message_id") or 0),
+                    "admin_message_id": int((sent or {}).get("message_id") or 0),
+                    "payment_caption": caption,
+                    "payment_submitted_at": datetime.now().isoformat(),
+                    "customer_username": str(from_user.get("username") or order.get("customer_username") or ""),
+                })
+        await _sell_bot_reset_customer_ui(token, chat_id)
+        await _telegram_send_message(token, chat_id, f"✅ رسید شما برای ادمین ارسال شد.\n🧾 سفارش: <code>{order_id}</code>\n⏳ منتظر تأیید بمانید.")
+        asyncio.create_task(save_state())
+        return
+
+    if not text_value:
+        return
+
+    # Every command resets the customer's previous inline UI before showing a fresh section.
+    await _sell_bot_reset_customer_ui(token, chat_id)
+    if not is_admin and str(chat.get("type") or "") == "private":
+        if command not in {"/start", "/help"} and not await _sell_bot_require_joins(token, chat_id, from_user.get("id")):
+            return
+        if command in {"/start", "/help"}:
+            if not await _sell_bot_require_joins(token, chat_id, from_user.get("id")):
+                return
+    if command in ("/start", "/help"):
+        welcome = str(sell.get("welcome_text") or "سلام 👋\nبرای استفاده از فروشگاه یکی از بخش‌های زیر را انتخاب کنید.")
+        if is_admin:
+            await _sell_bot_admin_menu(token, chat_id)
+            await _sell_bot_send_main_menu(token, chat_id, welcome)
+        else:
+            await _sell_bot_send_main_menu(token, chat_id, welcome)
+    elif command in ("/plans", "/buy"):
+        await _sell_bot_send_plans(token, chat_id)
+    elif command in ("/account", "/status", "/myaccount"):
+        await _sell_bot_send_account(token, chat_id)
+    elif command in ("/support", "/contact"):
+        await _sell_bot_send_support(token, chat_id)
+    elif command in ("/cancel",):
+        oid, order = await _find_active_sell_order(chat_id)
+        if oid and order and order.get("status") == "awaiting_payment":
+            async with BOT_ORDERS_LOCK:
+                if oid in BOT_ORDERS:
+                    BOT_ORDERS[oid]["status"] = "cancelled"
+                    BOT_ORDERS[oid]["cancelled_at"] = datetime.now().isoformat()
+            await _telegram_send_message(token, chat_id, f"✅ سفارش <code>{oid}</code> لغو شد.")
+            asyncio.create_task(save_state())
+        elif not is_admin:
+            await _telegram_send_message(token, chat_id, "ℹ️ سفارش قابل لغو وجود ندارد.")
+        await _sell_bot_send_main_menu(token, chat_id)
+    elif command in ("/orders", "/myorders"):
+        async with BOT_ORDERS_LOCK:
+            mine = [dict(o, order_id=oid) for oid, o in BOT_ORDERS.items() if str(o.get("chat_id")) == str(chat_id)]
+        mine = mine[-8:]
+        if not mine:
+            sent = await _telegram_send_message(token, chat_id, "🧾 <b>سفارش‌های من</b>\n\nهنوز سفارشی ثبت نکرده‌اید.", reply_markup={"inline_keyboard": [[{"text": "🛍 محصولات", "callback_data": "sell:products"}, {"text": "🏠 منوی اصلی", "callback_data": "sell:menu"}]]})
+        else:
+            labels = {"awaiting_payment":"در انتظار رسید", "payment_submitted":"در انتظار تأیید", "approved":"تأیید شد", "rejected":"رد شد", "cancelled":"لغو شد", "processing":"در حال پردازش"}
+            lines = [f"🧾 <code>{o['order_id']}</code> · {o.get('plan_snapshot',{}).get('name','')} · {labels.get(o.get('status'), o.get('status'))}" for o in mine]
+            sent = await _telegram_send_message(token, chat_id, "🧾 <b>سفارش‌های من</b>\n\n" + "\n".join(lines), reply_markup={"inline_keyboard": [[{"text": "🛍 محصولات", "callback_data": "sell:products"}], [{"text": "🏠 منوی اصلی", "callback_data": "sell:menu"}]]})
+        await _sell_bot_track_customer_message(chat_id, sent, "orders")
+    elif command == "/admin" and is_admin:
+        await _sell_bot_admin_menu(token, chat_id)
+    elif command == "/pending" and is_admin:
+        async with BOT_ORDERS_LOCK:
+            pending = [(oid, dict(o)) for oid, o in BOT_ORDERS.items() if o.get("status") == "payment_submitted"]
+        if not pending:
+            await _telegram_send_message(token, chat_id, "✅ رسید معلقی وجود ندارد.")
+        else:
+            for oid, o in pending[-20:]:
+                plan = o.get("plan_snapshot") or {}
+                await _telegram_send_message(token, chat_id, f"🧾 <b>سفارش {oid}</b>\n👤 <code>{o.get('telegram_user_id') or o.get('chat_id')}</code>\n📦 {plan.get('name')}", reply_markup={"inline_keyboard": [[{"text": "✅ تأیید", "callback_data": f"sell:approve:{oid}"}, {"text": "❌ رد", "callback_data": f"sell:reject:{oid}"}], [{"text": "⚙️ مدیریت", "callback_data": "sell:admin:menu"}]]})
+
+
+async def _sell_bot_handle_callback(token: str, callback: dict):
+    data = str(callback.get("data") or "").strip()
+    callback_id = str(callback.get("id") or "")
+    from_user = callback.get("from") or {}
+    user_id = str(from_user.get("id") or "")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "sell":
+        return
+    action = parts[1]
+    args = parts[2:]
+    sell = _bot_cfg().get("sell") or {}
+    admin_id = str(sell.get("admin_chat_id") or "").strip()
+    is_admin = user_id == admin_id
+    try:
+        # Admin callbacks always bypass the customer join gate. Customer callbacks
+        # clear the previous UI first, so an old button can never remain actionable
+        # behind a new join-gate or section screen.
+        if not is_admin and str(chat.get("type") or "") == "private":
+            if action != "join":
+                await _sell_bot_reset_customer_ui(token, chat_id)
+                if not await _sell_bot_require_joins(token, chat_id, user_id):
+                    await _telegram_answer_callback(token, callback_id, "ابتدا در کانال‌ها عضو شوید", True)
+                    return
+        if action == "menu":
+            await _telegram_answer_callback(token, callback_id)
+            await _sell_bot_send_main_menu(token, chat_id)
+            return
+        if action == "account":
+            await _telegram_answer_callback(token, callback_id)
+            await _sell_bot_send_account(token, chat_id)
+            return
+        if action == "products":
+            await _telegram_answer_callback(token, callback_id)
+            await _sell_bot_send_plans(token, chat_id)
+            return
+        if action == "support":
+            await _telegram_answer_callback(token, callback_id)
+            await _sell_bot_send_support(token, chat_id)
+            return
+        if action == "join":
+            sub = args[0] if args else "check"
+            if sub == "check":
+                await _telegram_answer_callback(token, callback_id, "در حال بررسی…")
+                if await _sell_bot_require_joins(token, chat_id, user_id):
+                    await _sell_bot_reset_customer_ui(token, chat_id)
+                    await _sell_bot_send_main_menu(token, chat_id)
+                return
+            await _telegram_answer_callback(token, callback_id)
+            return
+        # Customer plan pagination / selection.
+        if action == "plans":
+            await _telegram_answer_callback(token, callback_id)
+            await _sell_bot_send_plans(token, chat_id)
+            return
+        if action == "help":
+            await _telegram_answer_callback(token, callback_id)
+            await _sell_bot_send_main_menu(token, chat_id, "ℹ️ یک Plan را از «محصولات» انتخاب کنید، پرداخت را انجام دهید و رسید را همین‌جا ارسال کنید.")
+            return
+        if action == "orders":
+            await _telegram_answer_callback(token, callback_id)
+            async with BOT_ORDERS_LOCK:
+                mine = [dict(o, order_id=oid) for oid, o in BOT_ORDERS.items() if str(o.get("chat_id")) == str(chat_id)]
+            mine = mine[-8:]
+            if not mine:
+                sent = await _telegram_send_message(
+                    token, chat_id,
+                    "🧾 <b>سفارش‌های من</b>\n\nهنوز سفارشی ثبت نکرده‌اید.",
+                    reply_markup={"inline_keyboard": [[{"text": "🛍 محصولات", "callback_data": "sell:products"}, {"text": "🏠 منوی اصلی", "callback_data": "sell:menu"}]]}
+                )
+            else:
+                labels = {"awaiting_payment":"در انتظار رسید", "payment_submitted":"در انتظار تأیید", "approved":"تأیید شد", "rejected":"رد شد", "cancelled":"لغو شد", "processing":"در حال پردازش"}
+                lines = [f"🧾 <code>{o['order_id']}</code> · {o.get('plan_snapshot',{}).get('name','')} · {labels.get(o.get('status'), o.get('status'))}" for o in mine]
+                sent = await _telegram_send_message(
+                    token, chat_id,
+                    "🧾 <b>سفارش‌های من</b>\n\n" + "\n".join(lines),
+                    reply_markup={"inline_keyboard": [[{"text": "🛍 محصولات", "callback_data": "sell:products"}], [{"text": "🏠 منوی اصلی", "callback_data": "sell:menu"}]]}
+                )
+            await _sell_bot_track_customer_message(chat_id, sent, "orders")
+            return
+        if action == "cancel":
+            oid = str(args[0] if args else "").strip().upper()
+            async with BOT_ORDERS_LOCK:
+                order = BOT_ORDERS.get(oid)
+                if not order or str(order.get("chat_id")) != str(user_id) or order.get("status") != "awaiting_payment":
+                    raise RuntimeError("این سفارش قابل لغو نیست")
+                order["status"] = "cancelled"
+                order["cancelled_at"] = datetime.now().isoformat()
+            await _telegram_answer_callback(token, callback_id, "سفارش لغو شد")
+            await _sell_bot_send_main_menu(token, chat_id, f"✅ سفارش <code>{oid}</code> لغو شد.")
+            asyncio.create_task(save_state())
+            return
+        if action == "plan":
+            if str(chat.get("type") or "") != "private":
+                raise RuntimeError("خرید فقط در Private Chat انجام می‌شود")
+            plan_id = str(args[0] if args else "").strip()
+            plan = _find_sell_plan(plan_id)
+            if not plan:
+                raise RuntimeError("Plan پیدا نشد یا غیرفعال است")
+            existing_oid, _existing = await _find_active_sell_order(user_id)
+            if existing_oid:
+                raise RuntimeError(f"یک سفارش فعال دارید: {existing_oid} — ابتدا آن را تکمیل یا لغو کنید")
+            order_id = "ORD-" + secrets.token_hex(3).upper()
+            async with BOT_ORDERS_LOCK:
+                BOT_ORDERS[order_id] = {
+                    "chat_id": chat_id,
+                    "telegram_user_id": user_id,
+                    "customer_username": str(from_user.get("username") or ""),
+                    "plan_snapshot": plan,
+                    "status": "awaiting_payment",
+                    "created_at": datetime.now().isoformat(),
+                }
+            await _telegram_answer_callback(token, callback_id, "Plan انتخاب شد")
+            await _sell_bot_send_payment_prompt(token, chat_id, order_id, plan)
+            asyncio.create_task(save_state())
+            return
+
+        # Admin controls.
+        if action == "admin":
+            if not is_admin:
+                await _telegram_answer_callback(token, callback_id, "دسترسی ندارید", True)
+                return
+            sub = args[0] if args else "menu"
+            await _telegram_answer_callback(token, callback_id)
+            if sub == "menu":
+                await _sell_bot_admin_menu(token, chat_id)
+            elif sub == "add":
+                await _sell_bot_admin_start_wizard(token, admin_id, "add")
+            elif sub == "plans":
+                await _sell_bot_admin_plans(token, chat_id)
+            elif sub == "pending":
+                await _sell_bot_handle_message(token, {"chat": {"id": chat_id, "type": "private"}, "from": {"id": user_id}, "text": "/pending"})
+            elif sub == "close":
+                await _telegram_send_message(token, chat_id, "✅ منوی مدیریت بسته شد.")
+            elif sub == "edit":
+                pid = ":".join(args[1:]).strip()
+                plans = [p for p in (sell.get("plans") or []) if isinstance(p, dict)]
+                plan = next((dict(p) for p in plans if str(p.get("id") or "") == pid), None)
+                if not plan:
+                    raise RuntimeError("Plan پیدا نشد")
+                await _sell_bot_admin_start_wizard(token, admin_id, "edit", plan)
+            elif sub == "toggle":
+                if len(args) < 3:
+                    raise RuntimeError("شناسه Plan نامعتبر است")
+                pid = str(args[1])
+                enabled = str(args[2]) == "1"
+                plans = sell.setdefault("plans", [])
+                for plan in plans:
+                    if str(plan.get("id") or "") == pid:
+                        plan["enabled"] = enabled
+                        plan["updated_at"] = datetime.now().isoformat()
+                        break
+                else:
+                    raise RuntimeError("Plan پیدا نشد")
+                asyncio.create_task(save_state())
+                await _telegram_send_message(token, chat_id, "✅ وضعیت Plan تغییر کرد.", reply_markup={"inline_keyboard": [[{"text": "📦 Planها", "callback_data": "sell:admin:plans"}, {"text": "⚙️ مدیریت", "callback_data": "sell:admin:menu"}]]})
+            elif sub == "delete":
+                pid = ":".join(args[1:]).strip()
+                plans = sell.setdefault("plans", [])
+                before = len(plans)
+                sell["plans"] = [p for p in plans if str(p.get("id") or "") != pid]
+                if len(sell["plans"]) == before:
+                    raise RuntimeError("Plan پیدا نشد")
+                if not sell["plans"]:
+                    for legacy_key in ("plan_name", "price", "traffic_gb", "expire_days", "inbound_id"):
+                        sell.pop(legacy_key, None)
+                asyncio.create_task(save_state())
+                await _telegram_send_message(token, chat_id, "🗑 Plan حذف شد.", reply_markup={"inline_keyboard": [[{"text": "📦 Planها", "callback_data": "sell:admin:plans"}, {"text": "➕ Plan جدید", "callback_data": "sell:admin:add"}]]})
+            return
+
+        if action == "wiz":
+            if not is_admin:
+                await _telegram_answer_callback(token, callback_id, "دسترسی ندارید", True)
+                return
+            step_action = args[0] if args else ""
+            async with BOT_ADMIN_WIZARD_LOCK:
+                state = dict(BOT_ADMIN_WIZARD.get(admin_id) or {})
+            if not state and step_action not in {"cancel"}:
+                raise RuntimeError("فرآیند ساخت Plan منقضی شده است؛ دوباره شروع کنید")
+            if step_action == "cancel":
+                async with BOT_ADMIN_WIZARD_LOCK:
+                    BOT_ADMIN_WIZARD.pop(admin_id, None)
+                await _telegram_answer_callback(token, callback_id, "لغو شد")
+                await _sell_bot_admin_menu(token, chat_id)
+                return
+            plan = dict(state.get("plan") or {})
+            if step_action == "inbound":
+                inbound_id = ":".join(args[1:]).strip()
+                if not inbound_id or inbound_id not in INBOUNDS or inbound_id == "Node" or bool((INBOUNDS.get(inbound_id) or {}).get("system")):
+                    raise RuntimeError("Inbound نامعتبر است")
+                plan["inbound_id"] = inbound_id
+                state["step"] = "traffic"
+                state["plan"] = plan
+                await _telegram_answer_callback(token, callback_id, "Inbound انتخاب شد")
+                await _telegram_send_message(token, chat_id, "💾 <b>مرحله ۴/۶</b>\nحجم Plan را انتخاب کنید:", reply_markup=_sell_admin_traffic_markup())
+            elif step_action == "traffic":
+                value = ":".join(args[1:])
+                if value == "custom":
+                    state["step"] = "traffic_custom"
+                    await _telegram_answer_callback(token, callback_id)
+                    await _telegram_send_message(token, chat_id, "💾 مقدار حجم را به GB ارسال کنید. برای نامحدود <code>0</code> بفرستید.")
+                else:
+                    try:
+                        traffic = float(value)
+                    except Exception:
+                        raise RuntimeError("حجم نامعتبر است")
+                    if traffic < 0 or traffic > 1_000_000:
+                        raise RuntimeError("حجم خارج از محدوده است")
+                    plan["traffic_gb"] = traffic
+                    state["step"] = "days"
+                    state["plan"] = plan
+                    await _telegram_answer_callback(token, callback_id, "حجم انتخاب شد")
+                    await _telegram_send_message(token, chat_id, "⏳ <b>مرحله ۵/۶</b>\nمدت اعتبار را انتخاب کنید:", reply_markup=_sell_admin_days_markup())
+                async with BOT_ADMIN_WIZARD_LOCK:
+                    BOT_ADMIN_WIZARD[admin_id] = state
+            elif step_action == "days":
+                value = ":".join(args[1:])
+                if value == "custom":
+                    state["step"] = "days_custom"
+                    await _telegram_answer_callback(token, callback_id)
+                    await _telegram_send_message(token, chat_id, "⏳ تعداد روز را ارسال کنید. برای نامحدود <code>0</code> بفرستید.")
+                else:
+                    try:
+                        days = int(value)
+                    except Exception:
+                        raise RuntimeError("زمان نامعتبر است")
+                    if days < 0 or days > 36500:
+                        raise RuntimeError("زمان خارج از محدوده است")
+                    plan["expire_days"] = days
+                    state["step"] = "prefix"
+                    state["plan"] = plan
+                    await _telegram_answer_callback(token, callback_id, "زمان انتخاب شد")
+                    await _telegram_send_message(token, chat_id, "👤 <b>مرحله ۶/۶</b>\nپیشوند نام کاربر را ارسال کنید.\nمثلاً: <code>shop</code>")
+                async with BOT_ADMIN_WIZARD_LOCK:
+                    BOT_ADMIN_WIZARD[admin_id] = state
+            elif step_action == "confirm":
+                normalized = _normalize_plan_input(plan, plan if state.get("mode") == "edit" else None)
+                plans = sell.setdefault("plans", [])
+                if state.get("mode") == "edit":
+                    pid = str(plan.get("id") or "")
+                    for idx, old in enumerate(plans):
+                        if str(old.get("id") or "") == pid:
+                            plans[idx] = normalized
+                            break
+                    else:
+                        raise RuntimeError("Plan برای ویرایش پیدا نشد")
+                    text_value = "✅ Plan ویرایش شد."
+                else:
+                    plans.append(normalized)
+                    text_value = "✅ Plan اضافه شد."
+                async with BOT_ADMIN_WIZARD_LOCK:
+                    BOT_ADMIN_WIZARD.pop(admin_id, None)
+                await _telegram_answer_callback(token, callback_id, "ذخیره شد")
+                await _telegram_send_message(token, chat_id, text_value, reply_markup={"inline_keyboard": [[{"text": "📦 Planها", "callback_data": "sell:admin:plans"}, {"text": "➕ Plan بعدی", "callback_data": "sell:admin:add"}], [{"text": "⚙️ مدیریت", "callback_data": "sell:admin:menu"}]]})
+                asyncio.create_task(save_state())
+            async with BOT_ADMIN_WIZARD_LOCK:
+                if admin_id in BOT_ADMIN_WIZARD and state.get("step") not in {"confirm"}:
+                    BOT_ADMIN_WIZARD[admin_id] = state
+            return
+
+        if action == "approve" or action == "reject":
+            if not is_admin:
+                await _telegram_answer_callback(token, callback_id, "دسترسی ندارید", True)
+                return
+            oid = str(args[0] if args else "").strip().upper()
+            await _telegram_answer_callback(token, callback_id, "در حال پردازش…")
+            if action == "approve":
+                try:
+                    await _activate_sell_order(oid, admin_id)
+                except RuntimeError as exc:
+                    if "already approved" not in str(exc):
+                        raise
+            else:
+                await _sell_bot_reject_order(token, oid, admin_id)
+            mid = int(message.get("message_id") or 0)
+            if mid:
+                try:
+                    await _telegram_edit_message_reply_markup(token, chat_id, mid, {"inline_keyboard": []})
+                    label = "✅ رسید تأیید شد و حساب فعال شد." if action == "approve" else "❌ رسید رد شد."
+                    await _telegram_edit_message_caption(token, chat_id, mid, f"<b>{label}</b>\n🧾 سفارش <code>{oid}</code>")
+                except Exception:
+                    pass
+            return
+
+        if action == "help":
+            await _telegram_answer_callback(token, callback_id)
+            return
+
+    except Exception as e:
+        await _telegram_answer_callback(token, callback_id, str(e)[:180], True)
+        logger.warning("Sell Bot callback failed: %s", e)
+
+
+
+async def _sell_bot_expiry_loop():
+    """Remove expired panel users and notify Telegram-linked customers."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            now = datetime.now()
+            expired = []
+            async with USERS_LOCK:
+                for uid, user in list(USERS.items()):
+                    exp = str(user.get("expire_at") or "").strip()
+                    if not exp or user.get("status") == "disabled":
+                        continue
+                    try:
+                        if now >= datetime.fromisoformat(exp):
+                            expired.append((str(uid), dict(user)))
+                    except Exception:
+                        continue
+            for uid, user in expired[:100]:
+                chat_id = str(user.get("telegram_chat_id") or "").strip()
+                try:
+                    await _delete_bot_user(uid)
+                except Exception as e:
+                    logger.warning("Expired user delete failed uid=%s: %s", uid, e)
+                    continue
+                sell = _bot_cfg().get("sell") or {}
+                if chat_id and str((sell.get("customer_users") or {}).get(chat_id) or "") == uid:
+                    sell.setdefault("customer_users", {}).pop(chat_id, None)
+                token = str(_bot_cfg().get("token") or "").strip()
+                if token and chat_id:
+                    try:
+                        await _telegram_send_message(
+                            token, chat_id,
+                            "⛔ <b>اعتبار اشتراک شما تمام شد.</b>\nاکانت شما از پنل حذف شد. برای خرید مجدد به بخش «محصولات» بروید.",
+                            reply_markup=_sell_main_menu_markup(),
+                        )
+                    except Exception as e:
+                        logger.warning("Expired user Telegram notify failed chat=%s: %s", chat_id, e)
+            if expired:
+                asyncio.create_task(save_state())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Expiry sweep failed: %s", e)
+        await asyncio.sleep(60)
+
+
+async def _sell_bot_loop():
+    cleared_token = ""
+    last_save_monotonic = 0.0
+    while True:
+        try:
+            cfg = _bot_cfg()
+            sell = cfg.get("sell") or {}
+            token = str(cfg.get("token") or "").strip()
+            if not token or not bool(sell.get("enabled")):
+                cleared_token = ""
+                try:
+                    await asyncio.wait_for(BOT_WAKE.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    continue
+                BOT_WAKE.clear()
+                continue
+            if cleared_token != token:
+                try:
+                    await _telegram_api(token, "deleteWebhook", data={"drop_pending_updates": False}, timeout=10)
+                    cleared_token = token
+                except Exception as e:
+                    sell["last_error"] = str(e)[:400]
+                    await asyncio.sleep(10)
+                    continue
+            offset = int(sell.get("offset") or 0)
+            params = {"offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}
+            try:
+                updates = await _telegram_api(token, "getUpdates", data=params, timeout=32)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                sell["last_error"] = str(e)[:400]
+                await asyncio.sleep(5)
+                continue
+            changed = False
+            for update in updates or []:
+                changed = True
+                try:
+                    upd_id = int(update.get("update_id") or 0)
+                    if upd_id >= offset:
+                        sell["offset"] = upd_id + 1
+                    if update.get("callback_query"):
+                        await _sell_bot_handle_callback(token, update.get("callback_query") or {})
+                    elif update.get("message"):
+                        await _sell_bot_handle_message(token, update.get("message") or {})
+                except Exception as e:
+                    logger.warning("Sell Bot update failed: %s", e)
+            sell["last_update_at"] = datetime.now().isoformat()
+            sell["last_error"] = ""
+            now_m = time.monotonic()
+            if changed or (now_m - last_save_monotonic) >= 60:
+                last_save_monotonic = now_m
+                asyncio.create_task(save_state())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Sell Bot poller error: %s", e)
+            await asyncio.sleep(5)
+
+
+@app.get("/api/bot/status")
+async def bot_status(_=Depends(require_auth)):
+    cfg = _bot_cfg()
+    token = str(cfg.get("token") or "")
+    channel = dict(cfg.get("channel") or {})
+    sell = dict(cfg.get("sell") or {})
+    channel["channel"] = str(channel.get("channel") or "")
+    plans = []
+    for p in (sell.get("plans") or []):
+        if isinstance(p, dict):
+            q = dict(p)
+            q.pop("created_at", None)
+            plans.append(q)
+    sell_public = dict(sell)
+    sell_public["required_channels"] = [_normalize_required_channel(x) for x in (sell.get("required_channels") or []) if isinstance(x, (str, dict))]
+    sell_public.pop("customer_users", None)
+    sell_public.pop("offset", None)
+    return {
+        "ok": True,
+        "token_configured": bool(token),
+        "token_masked": _mask_bot_token(token),
+        "channel": channel,
+        "sell": sell_public,
+        "plans": plans,
+        "orders": {
+            "pending": sum(1 for x in BOT_ORDERS.values() if x.get("status") in {"awaiting_payment", "payment_submitted", "processing"}),
+            "payment_submitted": sum(1 for x in BOT_ORDERS.values() if x.get("status") == "payment_submitted"),
+            "approved": sum(1 for x in BOT_ORDERS.values() if x.get("status") == "approved"),
+            "rejected": sum(1 for x in BOT_ORDERS.values() if x.get("status") == "rejected"),
+            "cancelled": sum(1 for x in BOT_ORDERS.values() if x.get("status") == "cancelled"),
+        },
+        "scheduler_running": bool(BOT_SCHEDULER_TASK and not BOT_SCHEDULER_TASK.done()),
+        "poller_running": bool(BOT_POLL_TASK and not BOT_POLL_TASK.done()),
+    }
+
+
+@app.get("/api/bot/sell/plans")
+async def bot_sell_plans(_=Depends(require_auth)):
+    return {"ok": True, "plans": list(_bot_cfg()["sell"].get("plans") or [])}
+
+
+@app.post("/api/bot/sell/plans")
+async def bot_sell_plan_create(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    sell = _bot_cfg()["sell"]
+    plan = _normalize_plan_input(body or {})
+    sell.setdefault("plans", []).append(plan)
+    asyncio.create_task(save_state())
+    BOT_WAKE.set()
+    return {"ok": True, "plan": plan}
+
+
+@app.patch("/api/bot/sell/plans/{plan_id}")
+async def bot_sell_plan_edit(plan_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    sell = _bot_cfg()["sell"]
+    plans = sell.setdefault("plans", [])
+    for i, old in enumerate(plans):
+        if str(old.get("id")) == str(plan_id):
+            plan = _normalize_plan_input(body or {}, old)
+            plans[i] = plan
+            asyncio.create_task(save_state())
+            BOT_WAKE.set()
+            return {"ok": True, "plan": plan}
+    raise HTTPException(status_code=404, detail="plan not found")
+
+
+@app.delete("/api/bot/sell/plans/{plan_id}")
+async def bot_sell_plan_delete(plan_id: str, _=Depends(require_auth)):
+    sell = _bot_cfg()["sell"]
+    plans = sell.setdefault("plans", [])
+    before = len(plans)
+    sell["plans"] = [p for p in plans if str(p.get("id")) != str(plan_id)]
+    if len(sell["plans"]) == before:
+        raise HTTPException(status_code=404, detail="plan not found")
+    if not sell["plans"]:
+        # Clear legacy display fields so an empty store never resurrects a default plan.
+        for legacy_key in ("plan_name", "price", "traffic_gb", "expire_days", "inbound_id"):
+            sell.pop(legacy_key, None)
+    asyncio.create_task(save_state())
+    return {"ok": True}
+
+
+@app.post("/api/bot/config")
+async def bot_config_save(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    cfg = _bot_cfg()
+    incoming_token = str(body.get("token") or "").strip()
+    if incoming_token:
+        if not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{20,}", incoming_token):
+            raise HTTPException(status_code=400, detail="فرمت API Key تلگرام معتبر نیست")
+        cfg["token"] = incoming_token
+    ch_in = body.get("channel") or {}
+    sell_in = body.get("sell") or {}
+    ch = cfg["channel"]
+    ch["enabled"] = bool(ch_in.get("enabled", ch.get("enabled")))
+    ch["channel"] = str(ch_in.get("channel", ch.get("channel")) or "").strip()[:300]
+    ch["interval_minutes"] = max(1, min(int(ch_in.get("interval_minutes", ch.get("interval_minutes") or 60)), 10080))
+    ch["username_prefix"] = str(ch_in.get("username_prefix", ch.get("username_prefix") or "spider")).strip()[:24] or "spider"
+    ch["traffic_limit_gb"] = max(0.0, float(ch_in.get("traffic_limit_gb", ch.get("traffic_limit_gb") or 0) or 0))
+    ch["expire_days"] = max(0, int(ch_in.get("expire_days", ch.get("expire_days") or 0) or 0))
+    ch["inbound_id"] = str(ch_in.get("inbound_id", ch.get("inbound_id") or "")).strip()
+    ch["replace_previous"] = bool(ch_in.get("replace_previous", ch.get("replace_previous", True)))
+    if not ch["enabled"]:
+        ch["next_run_at"] = ""
+    elif not ch.get("next_run_at"):
+        ch["next_run_at"] = (datetime.now() + timedelta(minutes=ch["interval_minutes"])).isoformat()
+    sell = cfg["sell"]
+    sell["enabled"] = bool(sell_in.get("enabled", sell.get("enabled")))
+    try:
+        incoming_admin = str(sell_in.get("admin_chat_id", sell.get("admin_chat_id") or "")).strip()
+        if sell["enabled"] and not incoming_admin:
+            raise ValueError("Admin Numeric Telegram ID is required when Sell Bot is enabled")
+        if incoming_admin:
+            sell["admin_chat_id"] = _validate_admin_id(incoming_admin)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    sell["support_username"] = str(sell_in.get("support_username", sell.get("support_username") or "")).strip()[:64]
+    sell["support_text"] = str(sell_in.get("support_text", sell.get("support_text") or "")).strip()[:1000]
+    sell["payment_url"] = str(sell_in.get("payment_url", sell.get("payment_url") or "")).strip()[:500]
+    sell["payment_details"] = str(sell_in.get("payment_details", sell.get("payment_details") or "")).strip()[:3000]
+    required_in = sell_in.get("required_channels", None)
+    if required_in is not None:
+        if not isinstance(required_in, list):
+            raise HTTPException(status_code=400, detail="required_channels must be a list")
+        normalized_channels = []
+        try:
+            for item in required_in[:200]:
+                normalized_channels.append(_normalize_required_channel(item))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        sell["required_channels"] = normalized_channels
+    sell["welcome_text"] = str(sell_in.get("welcome_text", sell.get("welcome_text") or "")).strip()[:1200]
+    # Do not destroy managed plans when saving general bot settings.
+    if isinstance(sell_in.get("plans"), list):
+        normalized = []
+        for item in sell_in.get("plans")[:100]:
+            try:
+                normalized.append(_normalize_plan_input(item, item if item.get("id") else None))
+            except Exception:
+                continue
+        if normalized:
+            sell["plans"] = normalized
+    asyncio.create_task(save_state())
+    BOT_WAKE.set()
+    return {"ok": True, "token_masked": _mask_bot_token(cfg.get("token")), "channel": ch, "sell": sell, "plans": sell.get("plans") or []}
+
+
+@app.post("/api/bot/test")
+async def bot_test(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    cfg = _bot_cfg()
+    token = str(body.get("token") or cfg.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="اول Telegram Bot API Key را وارد کنید")
+    try:
+        me = await _telegram_api(token, "getMe", data={}, timeout=12)
+        channel_input = str(body.get("channel") or (cfg.get("channel") or {}).get("channel") or "").strip()
+        channel_info = None
+        if channel_input:
+            chat_id, channel_url, channel_label = _normalize_tg_channel(channel_input)
+            if str(chat_id).startswith("@") or re.fullmatch(r"-?\d{5,}", str(chat_id)):
+                chat = await _telegram_api(token, "getChat", data={"chat_id": chat_id}, timeout=12)
+                if str(chat.get("type") or "") != "channel":
+                    raise RuntimeError("آی‌دی وارد شده مربوط به Channel نیست")
+                admins = []
+                try:
+                    admins = await _telegram_api(token, "getChatAdministrators", data={"chat_id": chat_id}, timeout=12)
+                except Exception:
+                    admins = []
+                bot_id = int(me.get("id") or 0)
+                bot_member = next((a for a in admins if int((a.get("user") or {}).get("id") or 0) == bot_id), None)
+                channel_info = {
+                    "id": chat.get("id"),
+                    "title": chat.get("title"),
+                    "username": chat.get("username"),
+                    "is_admin": bool(bot_member),
+                    "can_post_messages": bool((bot_member or {}).get("can_post_messages", False)) if bot_member else False,
+                    "url": (f"https://t.me/{chat.get('username')}" if chat.get("username") else channel_url),
+                }
+        return {"ok": True, "bot": {"id": me.get("id"), "username": me.get("username"), "first_name": me.get("first_name")}, "channel": channel_info}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/bot/channel/run")
+async def bot_channel_run(_=Depends(require_auth)):
+    cfg = _bot_cfg()
+    if not cfg.get("channel", {}).get("channel"):
+        raise HTTPException(status_code=400, detail="Channel را تنظیم کنید")
+    try:
+        return await _channel_bot_run_once()
+    except Exception as e:
+        ch = cfg.get("channel") or {}
+        ch["error_count"] = int(ch.get("error_count") or 0) + 1
+        ch["last_error"] = str(e)[:400]
+        asyncio.create_task(save_state())
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

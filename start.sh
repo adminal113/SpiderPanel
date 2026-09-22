@@ -1543,13 +1543,9 @@ info_panel() {
     echo "================================================"
 
 
+    # Panel port is intentionally fixed. Deployers may inject PORT, but
+    # SpiderPanel always listens on 8080.
     local listen_port="8080"
-    if [[ -f "$ENV_FILE" ]]; then
-        listen_port="$(
-            grep '^PORT=' "$ENV_FILE" 2>/dev/null             | head -n1             | cut -d= -f2-             || echo "8080"
-        )"
-    fi
-    [[ "$listen_port" =~ ^[0-9]+$ ]] || listen_port="8080"
 
     echo "Local URL: http://127.0.0.1:${listen_port}/spider"
 

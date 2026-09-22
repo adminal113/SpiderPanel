@@ -532,6 +532,15 @@ input,select,button,textarea{font-family:inherit}
 }
 #tab-worker .panel:first-child,#tab-contact .panel:first-child{margin-top:0!important;}
 #tab-contact .contact-panel{height:auto!important;min-height:0!important;max-height:none!important;}
+.bot-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 14px}
+.bot-tab{border:1px solid var(--border);background:var(--input-bg);color:var(--txt2);border-radius:10px;padding:9px 14px;cursor:pointer;font-weight:700}
+.bot-tab.active{background:var(--tab-bg);color:var(--tab-color);border-color:transparent}
+.bot-subpanel{display:none}.bot-subpanel.active{display:block}
+.bot-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}
+.bot-status-card{border:1px solid var(--border);border-radius:12px;padding:10px 12px;background:var(--bg3)}
+.bot-status-card b{display:block;font-size:14px;margin-top:3px;word-break:break-word}
+.bot-note{font-size:11px;color:var(--txt2);line-height:1.8;margin-top:8px}.bot-plan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.bot-plan-card{border:1px solid var(--border);border-radius:14px;padding:12px;background:var(--bg3);margin-top:8px}.bot-plan-title{display:flex;align-items:center;justify-content:space-between;gap:8px}.bot-plan-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}.bot-plan-meta{font-size:11px;color:var(--txt2);line-height:1.8;margin-top:5px}.bot-inline-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.bot-acc-list{display:flex;flex-direction:column;gap:10px;margin-top:10px}.bot-acc{border:1px solid var(--border);border-radius:14px;overflow:hidden;background:var(--bg2)}.bot-acc-head{width:100%;display:flex;align-items:center;gap:10px;padding:13px 14px;background:transparent;border:0;color:var(--txt);cursor:pointer;font:700 13px inherit;text-align:right}.bot-acc-head .material-symbols-outlined{margin-right:auto;transition:transform .2s}.bot-acc.open .bot-acc-head .material-symbols-outlined{transform:rotate(180deg)}.bot-acc-body{display:none;padding:12px 14px 14px;border-top:1px solid var(--border)}.bot-acc.open .bot-acc-body{display:block}.bot-join-list{display:flex;flex-direction:column;gap:8px}.bot-join-row{display:grid;grid-template-columns:1.1fr 1.2fr auto;gap:8px;align-items:end;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--bg3)}.bot-join-row input{width:100%;padding:10px 12px;background:var(--input-bg);border:1px solid var(--border);border-radius:10px;color:var(--txt);outline:none}.bot-join-row .btn-glass{white-space:nowrap}@media(max-width:700px){.bot-join-row{grid-template-columns:1fr}.bot-join-row .btn-glass{width:100%}}
 .content{justify-content:flex-start!important;align-items:stretch!important;overflow-anchor:none!important;scroll-padding-top:0!important;}
 
 /* LTR (English) adjustments — iOS system font */
@@ -680,6 +689,9 @@ tr{animation:fadeIn .3s ease}
 .modal-c::before{content:none}
 .modal-t{font-size:19px;font-weight:700;margin-bottom:18px;position:relative}
 .modal-t .glow{background:var(--gradient);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.cfg-copy-btn{position:absolute;left:0;top:50%;transform:translateY(-50%);width:34px;height:34px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:10px;cursor:pointer}
+.cfg-copy-btn svg{width:17px;height:17px}
+.cfg-copy-btn:active{transform:translateY(-50%) scale(.94)}
 .modal-btns{display:flex;gap:8px;margin-top:18px;position:relative}
 .modal-btns .btn{flex:1;justify-content:center;padding:11px}
 /* Modal X close button (top-right corner of every modal) */
@@ -1180,6 +1192,10 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
             <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><line x1="12" y1="8" x2="5" y2="16"/><line x1="12" y1="8" x2="19" y2="16"/></svg></span>
             <span data-i18n="nodes">نودها</span>
           </div>
+          <div class="nav-item" onclick="switchTab('bot',this)">
+            <span class="nav-ic"><span class="material-symbols-outlined" style="font-size:18px">smart_toy</span></span>
+            <span data-i18n="bot">Bot</span>
+          </div>
           <div class="nav-item" onclick="switchTab('settings',this)">
             <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg></span>
             <span data-i18n="settings">تنظیمات</span>
@@ -1471,6 +1487,127 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
             </div>
             <button class="btn btn-sm btn-r" onclick="workerDisconnect()" style="margin-top:6px"><span data-i18n="removeConn">حذف اتصال Worker</span></button>
           </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BOT TAB -->
+      <div class="tab-content hidden" id="tab-bot">
+        <div class="panel">
+          <div class="panel-h" style="justify-content:space-between">
+            <span class="glow">🤖 <span data-i18n="bot">Telegram Bot</span></span>
+            <span id="bot-status-badge" class="badge badge-b">OFF</span>
+          </div>
+          <div class="f-g" style="margin-top:10px">
+            <label>Telegram Bot API Key</label>
+            <input id="bot-token" type="password" dir="ltr" autocomplete="new-password" placeholder="123456789:AA...">
+          </div>
+          <div class="bot-note">توکن فقط سمت سرور ذخیره می‌شود. یک Bot می‌تواند هم‌زمان Channel Bot و Sell Bot را اجرا کند.</div>
+          <div class="bot-inline-actions">
+            <button class="btn btn-p" onclick="saveBotConfig()">ذخیره تنظیمات</button>
+            <button class="btn btn-g" onclick="testBotConfig()">تست Bot</button>
+            <button class="btn btn-g" onclick="loadBot()">بروزرسانی</button>
+          </div>
+          <div id="bot-account-info" class="bot-status-grid"></div>
+        </div>
+
+        <div class="panel" style="margin-top:10px">
+          <div class="bot-tabs">
+            <button id="bot-tab-channel-btn" class="bot-tab active" onclick="switchBotSubtab('channel')">📣 Channel Bot</button>
+            <button id="bot-tab-sell-btn" class="bot-tab" onclick="switchBotSubtab('sell')">🛒 Sell Bot</button>
+          </div>
+
+          <div id="bot-sub-channel" class="bot-subpanel active">
+            <div class="bot-acc-list">
+              <div class="bot-acc open" id="botacc-channel-main">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-channel-main')"><span>📣 انتشار زمان‌بندی‌شده</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="f-g"><label>فعال‌سازی</label><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="bot-channel-enabled" type="checkbox"> ایجاد و ارسال خودکار</label></div>
+                  <div class="f-g"><label>لینک Channel</label><input id="bot-channel" type="text" dir="ltr" placeholder="https://t.me/mychannel یا @mychannel"></div>
+                  <div class="f-r">
+                    <div class="f-g"><label>زمان‌بندی (دقیقه)</label><input id="bot-channel-interval" type="number" min="1" max="10080" value="60" dir="ltr"></div>
+                    <div class="f-g"><label>پیشوند نام کاربر</label><input id="bot-channel-prefix" type="text" dir="ltr" value="spider"></div>
+                  </div>
+                  <div class="f-r">
+                    <div class="f-g"><label>ترافیک هر کاربر (GB) — ۰ نامحدود</label><input id="bot-channel-traffic" type="number" min="0" step="0.1" value="0" dir="ltr"></div>
+                    <div class="f-g"><label>اعتبار (روز) — ۰ نامحدود</label><input id="bot-channel-days" type="number" min="0" value="30" dir="ltr"></div>
+                  </div>
+                  <div class="f-g"><label>Inbound</label><select id="bot-channel-inbound" dir="ltr"><option value="">Default TLS/WS</option></select></div>
+                  <div class="f-g"><label>جایگزینی خودکار</label><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="bot-channel-replace" type="checkbox" checked> بعد از ارسال موفق، کاربر قبلی حذف شود</label></div>
+                  <div class="bot-note">ترتیب امن: ساخت کاربر جدید → تولید Subscription/QR → ارسال موفق به Channel → حذف کاربر قبلی. اگر ارسال ناموفق باشد، کاربر قبلی حفظ می‌شود.</div>
+                  <div class="bot-inline-actions"><button class="btn btn-p" onclick="saveBotConfig()">ذخیره Channel Bot</button><button class="btn btn-g" onclick="runChannelBotNow()">ساخت و ارسال الان</button></div>
+                </div>
+              </div>
+              <div class="bot-acc" id="botacc-channel-status">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-channel-status')"><span>📊 وضعیت Channel Bot</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body"><div id="bot-channel-next" class="bot-status-grid"></div></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="bot-sub-sell" class="bot-subpanel">
+            <div class="bot-acc-list">
+              <div class="bot-acc open" id="botacc-sell-general">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-general')"><span>⚙️ تنظیمات Sell Bot</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="f-g"><label>فعال‌سازی</label><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="bot-sell-enabled" type="checkbox"> فعال‌سازی فروش و بررسی رسید</label></div>
+                  <div class="f-g"><label>Admin Numeric Telegram ID</label><input id="bot-sell-admin" type="text" dir="ltr" inputmode="numeric" placeholder="123456789"></div>
+                  <div class="bot-note">فقط همین Telegram ID به ابزارهای مدیریت Sell Bot دسترسی دارد.</div>
+                </div>
+              </div>
+
+              <div class="bot-acc open" id="botacc-sell-products">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-products')"><span>🛍 محصولات و Planها</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="bot-note">هر Plan کاملاً مستقل است و می‌تواند Inbound، حجم، زمان، قیمت و پیشوند کاربر خودش را داشته باشد. حذف آخرین Plan نیز مجاز است.</div>
+                  <input id="bot-plan-id" type="hidden">
+                  <div class="bot-plan-grid" style="margin-top:10px">
+                    <div class="f-g"><label>اسم Plan</label><input id="bot-plan-name" type="text" placeholder="مثلاً 100GB / 30D"></div>
+                    <div class="f-g"><label>قیمت</label><input id="bot-plan-price" type="text" dir="ltr" placeholder="250000 تومان"></div>
+                    <div class="f-g"><label>Inbound</label><select id="bot-plan-inbound" dir="ltr"><option value="">انتخاب Inbound</option></select></div>
+                    <div class="f-g"><label>حجم (GB) — ۰ نامحدود</label><input id="bot-plan-traffic" type="number" min="0" step="0.1" value="50" dir="ltr"></div>
+                    <div class="f-g"><label>زمان (روز) — ۰ نامحدود</label><input id="bot-plan-days" type="number" min="0" value="30" dir="ltr"></div>
+                    <div class="f-g"><label>پیشوند کاربر</label><input id="bot-plan-prefix" type="text" dir="ltr" value="shop"></div>
+                  </div>
+                  <div class="bot-inline-actions"><button class="btn btn-p" onclick="saveSellPlan()"><span id="bot-plan-save-label">➕ افزودن Plan</span></button><button class="btn btn-g" onclick="resetSellPlanForm()">پاک کردن فرم</button></div>
+                  <div id="bot-sell-plans-list"></div>
+                </div>
+              </div>
+
+              <div class="bot-acc" id="botacc-sell-join">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-join')"><span>🔒 جوین اجباری</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="bot-note">هر تعداد Channel که بخواهی می‌توانی اضافه کنی. برای @username، Join Link خودکار ساخته می‌شود. برای کانال عددی، Join Link را هم وارد کن.</div>
+                  <div id="bot-join-list" class="bot-join-list"></div>
+                  <div class="bot-inline-actions"><button class="btn btn-g" onclick="addBotJoinRow()">➕ افزودن Channel</button></div>
+                </div>
+              </div>
+
+              <div class="bot-acc" id="botacc-sell-payment">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-payment')"><span>💳 پرداخت</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="f-g"><label>لینک پرداخت (اختیاری)</label><input id="bot-sell-payment" type="url" dir="ltr" placeholder="https://..."></div>
+                  <div class="f-g"><label>اطلاعات پرداخت</label><textarea id="bot-sell-payment-details" rows="4" placeholder="شماره کارت، نام صاحب حساب، توضیحات پرداخت و ..."></textarea></div>
+                </div>
+              </div>
+
+              <div class="bot-acc" id="botacc-sell-support">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-support')"><span>💬 پشتیبانی</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="f-g"><label>Username / لینک پشتیبانی</label><input id="bot-sell-support" type="text" dir="ltr" placeholder="@support یا https://t.me/support"></div>
+                  <div class="f-g"><label>متن بخش پشتیبانی</label><textarea id="bot-sell-support-text" rows="3" placeholder="برای پشتیبانی ..."></textarea></div>
+                </div>
+              </div>
+
+              <div class="bot-acc" id="botacc-sell-orders">
+                <button type="button" class="bot-acc-head" onclick="toggleBotAcc('botacc-sell-orders')"><span>🧾 سفارش‌ها و وضعیت فروش</span><span class="material-symbols-outlined">expand_more</span></button>
+                <div class="bot-acc-body">
+                  <div class="bot-note">خریدار: محصول → پرداخت → ارسال رسید. ادمین: دریافت رسید → ✅ تأیید و فعال‌سازی / ❌ رد. برای جلوگیری از دوباره‌کاری، فعال‌سازی idempotent است.</div>
+                  <div id="bot-sell-orders" class="bot-status-grid"></div>
+                  <div class="bot-inline-actions"><button class="btn btn-p" onclick="saveBotConfig()">ذخیره Sell Bot</button></div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1825,7 +1962,15 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
 
 <!-- CONFIG VIEWER -->
 <div class="modal" id="mod-cfg"><div class="modal-c">
-  <div class="modal-t"><span class="glow" data-i18n="config">کانفیگ</span></div>
+  <div class="modal-t">
+    <span class="glow" data-i18n="config">کانفیگ</span>
+    <button type="button" class="btn btn-g cfg-copy-btn" onclick="copyCfg()" title="کپی همه کانفیگ‌ها" aria-label="کپی همه کانفیگ‌ها">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="9" width="11" height="11" rx="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+    </button>
+  </div>
   <pre class="cfg-code" id="cfg-code"></pre>
   <div class="modal-btns">
     <button class="btn btn-g" onclick="closeModal('mod-cfg')"><span data-i18n="close">بستن</span></button>
@@ -1914,7 +2059,7 @@ var I18N = {
     'acTcpTesting': 'تست دامنه‌های TCP (دامنه + IP هر دو تست می‌شوند)...', 'acSniTesting': 'تست SNI ها و ذخیره سریع‌ترین‌ها...', 'acFinalPing': 'پینگ نهایی به دامنه فعلی پنل...', 'acDone': 'اتمام اسکن خودکار ✓',
     'tunnelNotReady': 'ابتدا یک Worker در تب Worker بسازید — بخش Tunnel بعد از ساخت Worker فعال می‌شود.', 'tunnelPath': 'مسیر اتصال', 'workerPing': 'پینگ سرور تا Worker', 'tunnelKv': 'KV اختصاصی Tunnel', 'tunnelInboundPath': 'اینباند (TLS WS)', 'tunnelCreate': 'ایجاد اینباند Tunnel', 'tunnelCreated': 'اینباند Tunnel ساخته شد', 'tunnelNoWorker': 'Worker متصل نیست',
     'reverse': 'Reverse', 'reverseSwitch': 'حالت Reverse', 'reverseHint': 'با روشن کردن این سوییچ، مسیر اتصال برعکس می‌شود: User → Worker → Railway → Site. دامنه کانفیگ، دامنه Worker و مسیر /reverse/{uuid} خواهد بود.', 'reverseOn': 'Reverse فعال شد', 'reverseOff': 'Reverse غیرفعال شد',
-    'nodes': 'نودها', 'addNode': 'افزودن نود', 'editNode': 'ویرایش نود', 'nodeDomain': 'دامنه نود', 'nodeApiKey': 'API Key', 'nodeStatus': 'وضعیت', 'nodeOnline': 'آنلاین', 'nodeOffline': 'آفلاین', 'nodeSynced': 'همگام‌سازی شد', 'nodeSyncFailed': 'خطا در همگام‌سازی', 'nodeDelete': 'حذف نود', 'confirmDeleteNode': 'آیا از حذف این نود اطمینان دارید؟', 'nodeDeleted': 'نود حذف شد', 'nodeSyncing': 'در حال همگام‌سازی...', 'nodeIp': 'آی‌پی سرور', 'nodeLatency': 'پینگ', 'syncAllNodes': 'همگام‌سازی همه', 'noNodes': 'هنوز نودی اضافه نشده', 'nodeAdded': 'نود اضافه شد', 'nodeUpdated': 'نود بروزرسانی شد',
+    'bot': 'Bot', 'telegramBotApiKey': 'Telegram Bot API Key', 'telegramBotTokenHint': 'توکن فقط روی سرور ذخیره می‌شود و در پنل کامل نمایش داده نمی‌شود.', 'nodes': 'نودها', 'addNode': 'افزودن نود', 'editNode': 'ویرایش نود', 'nodeDomain': 'دامنه نود', 'nodeApiKey': 'API Key', 'nodeStatus': 'وضعیت', 'nodeOnline': 'آنلاین', 'nodeOffline': 'آفلاین', 'nodeSynced': 'همگام‌سازی شد', 'nodeSyncFailed': 'خطا در همگام‌سازی', 'nodeDelete': 'حذف نود', 'confirmDeleteNode': 'آیا از حذف این نود اطمینان دارید؟', 'nodeDeleted': 'نود حذف شد', 'nodeSyncing': 'در حال همگام‌سازی...', 'nodeIp': 'آی‌پی سرور', 'nodeLatency': 'پینگ', 'syncAllNodes': 'همگام‌سازی همه', 'noNodes': 'هنوز نودی اضافه نشده', 'nodeAdded': 'نود اضافه شد', 'nodeUpdated': 'نود بروزرسانی شد',
     'serverIp': 'آی‌پی سرور', 'serverInfo': 'اطلاعات سرور', 'apiKey': 'API Key', 'copyApiKey': 'کپی API Key', 'inboundType': 'Inbound Type', 'config': 'Config', 'telegramProxy': 'Telegram Proxy',
     'login': { 'signIn': 'Sign In' }
   },
@@ -1975,7 +2120,7 @@ var I18N = {
     'acTcpTesting': 'Testing TCP domains (both domain and resolved IP)...', 'acSniTesting': 'Testing SNIs and saving the fastest...', 'acFinalPing': 'Final ping to the current panel domain...', 'acDone': 'Auto scan complete ✓',
     'tunnelNotReady': 'Create a Worker first — the Tunnel section activates once a Worker is connected.', 'tunnelPath': 'Connect path', 'workerPing': 'Server → Worker ping', 'tunnelKv': 'Dedicated Tunnel KV', 'tunnelInboundPath': 'Inbound (TLS WS)', 'tunnelCreate': 'Create Tunnel Inbound', 'tunnelCreated': 'Tunnel inbound created', 'tunnelNoWorker': 'Worker not connected',
     'reverse': 'Reverse', 'reverseSwitch': 'Reverse mode', 'reverseHint': 'When on, the connect path flips: User → Worker → Railway → Site. The config domain becomes the Worker domain with path /reverse/{uuid}.', 'reverseOn': 'Reverse enabled', 'reverseOff': 'Reverse disabled',
-    'nodes': 'Nodes', 'addNode': 'Add Node', 'editNode': 'Edit Node', 'nodeDomain': 'Node Domain', 'nodeApiKey': 'API Key', 'nodeStatus': 'Status', 'nodeOnline': 'Online', 'nodeOffline': 'Offline', 'nodeSynced': 'Synced', 'nodeSyncFailed': 'Sync failed', 'nodeDelete': 'Delete Node', 'confirmDeleteNode': 'Are you sure you want to delete this node?', 'nodeDeleted': 'Node deleted', 'nodeSyncing': 'Syncing...', 'nodeIp': 'Server IP', 'nodeLatency': 'Ping', 'syncAllNodes': 'Sync All', 'noNodes': 'No nodes added yet', 'nodeAdded': 'Node added', 'nodeUpdated': 'Node updated',
+    'bot': 'Bot', 'telegramBotApiKey': 'Telegram Bot API Key', 'telegramBotTokenHint': 'The token is stored server-side and is never shown in full.', 'nodes': 'Nodes', 'addNode': 'Add Node', 'editNode': 'Edit Node', 'nodeDomain': 'Node Domain', 'nodeApiKey': 'API Key', 'nodeStatus': 'Status', 'nodeOnline': 'Online', 'nodeOffline': 'Offline', 'nodeSynced': 'Synced', 'nodeSyncFailed': 'Sync failed', 'nodeDelete': 'Delete Node', 'confirmDeleteNode': 'Are you sure you want to delete this node?', 'nodeDeleted': 'Node deleted', 'nodeSyncing': 'Syncing...', 'nodeIp': 'Server IP', 'nodeLatency': 'Ping', 'syncAllNodes': 'Sync All', 'noNodes': 'No nodes added yet', 'nodeAdded': 'Node added', 'nodeUpdated': 'Node updated',
     'serverIp': 'Server IP', 'serverInfo': 'Server Info', 'apiKey': 'API Key', 'copyApiKey': 'Copy API Key', 'inboundType': 'Inbound Type', 'config': 'Config', 'telegramProxy': 'Telegram Proxy',
     'login': { 'signIn': 'Sign In' }
   }
@@ -2263,7 +2408,7 @@ function toggleNodeAccordion(btn) {
 }
 
 function switchTab(tab, el) {
-  if (['users','inbounds','scanner','worker','settings'].indexOf(tab) >= 0) toggleNavAccordion(true);
+  if (['users','inbounds','scanner','worker','bot','settings'].indexOf(tab) >= 0) toggleNavAccordion(true);
   document.querySelectorAll('.nav-item').forEach(function(n) { n.classList.remove('active'); });
   if (el) el.classList.add('active');
   var content = document.querySelector('.content');
@@ -2305,6 +2450,7 @@ function switchTab(tab, el) {
   if (tab === 'worker') loadWorker();
   if (tab === 'tunnel') loadTunnel();
   if (tab === 'nodes') loadNodes();
+  if (tab === 'bot') loadBot();
   closeSidebar();
 }
 
@@ -3292,6 +3438,7 @@ wireModalCloseButtons();
 
 // ─── Helpers ───
 function esc(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escAttr(s) { return esc(s).replace(/'/g,'&#39;').replace(/`/g,'&#96;'); }
 function toFa(n) { return String(n).replace(/\d/g, function(d) { return '۰۱۲۳۴۵۶۷۸۹'[d]; }); }
 function fmtBytes(b) {
   if (!b || b <= 0) return '0 B';
@@ -4646,6 +4793,92 @@ async function syncAllNodes(){
   catch(e){toast(e.message || t('nodeSyncFailed'),'err');}
 }
 
+
+// ─── TELEGRAM BOT ───────────────────────────────────────────────────────────
+function toggleBotAcc(id){var el=$id(id);if(el)el.classList.toggle('open');}
+function switchBotSubtab(which) {
+  ['channel','sell'].forEach(function(k){
+    var pane=$id('bot-sub-'+k), btn=$id('bot-tab-'+k+'-btn');
+    if(pane) pane.classList.toggle('active', k===which);
+    if(btn) btn.classList.toggle('active', k===which);
+  });
+  if(which==='sell'){ loadBotInbounds(); loadSellPlans(); }
+}
+async function loadBotInbounds() {
+  try{
+    var d=await api('/api/inbounds'); var items=Array.isArray(d)?d:(d.inbounds||[]);
+    ['bot-channel-inbound','bot-plan-inbound'].forEach(function(id){
+      var el=$id(id); if(!el) return;
+      var first = id==='bot-channel-inbound' ? '<option value="">Default TLS/WS</option>' : '<option value="">انتخاب Inbound</option>';
+      el.innerHTML = first + items.filter(function(x){return x.id!=='Node' && !(x.system)}).map(function(x){ return '<option value="'+escAttr(String(x.id||''))+'">'+esc(x.name||x.id||'Inbound')+'</option>'; }).join('');
+    });
+  }catch(e){console.error(e);}
+}
+function fillBotStatus(d){
+  var b=$id('bot-status-badge'); if(b){b.textContent=d.token_configured?'ON':'OFF';b.className='badge '+(d.token_configured?'badge-g':'badge-b');}
+  var info=$id('bot-account-info'); if(info&&d.token_masked){ info.innerHTML='<div class="bot-status-card"><span>API Key</span><b dir="ltr">'+esc(d.token_masked)+'</b></div>'; }
+  var ch=d.channel||{}, sell=d.sell||{};
+  var cs=$id('bot-channel-state'); if(cs){cs.textContent=ch.enabled?'ON':'OFF';cs.className='badge '+(ch.enabled?'badge-g':'badge-b');}
+  var ss=$id('bot-sell-state'); if(ss){ss.textContent=sell.enabled?'ON':'OFF';ss.className='badge '+(sell.enabled?'badge-g':'badge-b');}
+  var cn=$id('bot-channel-next'); if(cn) cn.innerHTML=
+    '<div class="bot-status-card"><span>موفق</span><b>'+esc(String(ch.success_count||0))+'</b></div>'+
+    '<div class="bot-status-card"><span>خطا</span><b>'+esc(String(ch.error_count||0))+'</b></div>'+
+    '<div class="bot-status-card"><span>آخرین اجرا</span><b dir="ltr" style="font-size:11px">'+esc(ch.last_run_at||'—')+'</b></div>'+
+    '<div class="bot-status-card"><span>اجرای بعدی</span><b dir="ltr" style="font-size:11px">'+esc(ch.next_run_at||'—')+'</b></div>'+
+    '<div class="bot-status-card"><span>حذف معلق</span><b>'+esc(String((ch.pending_delete_user_ids||[]).length))+'</b></div>'+
+    '<div class="bot-status-card"><span>خطای حذف</span><b style="font-size:11px;color:var(--red)">'+esc(ch.last_delete_error||'—')+'</b></div>';
+  var so=$id('bot-sell-orders'); if(so) so.innerHTML=
+    '<div class="bot-status-card"><span>در انتظار رسید</span><b>'+esc(String((d.orders||{}).pending||0))+'</b></div>'+
+    '<div class="bot-status-card"><span>رسیدهای ارسالی</span><b>'+esc(String((d.orders||{}).payment_submitted||0))+'</b></div>'+
+    '<div class="bot-status-card"><span>Approved</span><b>'+esc(String((d.orders||{}).approved||0))+'</b></div>'+
+    '<div class="bot-status-card"><span>Rejected</span><b>'+esc(String((d.orders||{}).rejected||0))+'</b></div>'+
+    '<div class="bot-status-card"><span>Cancelled</span><b>'+esc(String((d.orders||{}).cancelled||0))+'</b></div>';
+  renderSellPlans(d.plans || sell.plans || []);
+  renderBotJoinRows(sell.required_channels||[]);
+}
+function renderSellPlans(plans){
+  var wrap=$id('bot-sell-plans-list'); if(!wrap) return;
+  if(!plans.length){ wrap.innerHTML='<div class="bot-note" style="margin-top:12px">هیچ Plan فعالی/ذخیره‌شده‌ای وجود ندارد.</div>'; return; }
+  var html='';
+  plans.forEach(function(p){
+    var traffic=Number(p.traffic_gb||0)<=0?'نامحدود':(Number(p.traffic_gb)||0)+' GB';
+    var days=Number(p.expire_days||0)<=0?'نامحدود':(Number(p.expire_days)||0)+' روز';
+    html+='<div class="bot-plan-card">'+
+      '<div class="bot-plan-title"><b>'+esc(p.name||'Plan')+'</b><span class="badge '+(p.enabled===false?'badge-b':'badge-g')+'">'+(p.enabled===false?'OFF':'ON')+'</span></div>'+
+      '<div class="bot-plan-meta">💰 '+esc(p.price||'—')+' · 💾 '+esc(traffic)+' · ⏳ '+esc(days)+' · 🌐 '+esc(p.inbound_id||'Default')+' · 👤 '+esc(p.username_prefix||'shop')+'</div>'+
+      '<div class="bot-plan-actions">'+
+      '<button class="btn-glass" onclick="editSellPlan(\''+escAttr(String(p.id||''))+'\')">ویرایش</button>'+
+      '<button class="btn-glass" onclick="toggleSellPlan(\''+escAttr(String(p.id||''))+'\','+(p.enabled===false?'true':'false')+')">'+(p.enabled===false?'فعال کردن':'غیرفعال کردن')+'</button>'+
+      '<button class="btn-glass" onclick="deleteSellPlan(\''+escAttr(String(p.id||''))+'\')">حذف</button>'+
+      '</div></div>';
+  });
+  wrap.innerHTML=html;
+}
+function resetSellPlanForm(){
+  if($id('bot-plan-id')) $id('bot-plan-id').value='';
+  if($id('bot-plan-name')) $id('bot-plan-name').value='';
+  if($id('bot-plan-price')) $id('bot-plan-price').value='';
+  if($id('bot-plan-traffic')) $id('bot-plan-traffic').value='50';
+  if($id('bot-plan-days')) $id('bot-plan-days').value='30';
+  if($id('bot-plan-prefix')) $id('bot-plan-prefix').value='shop';
+  if($id('bot-plan-inbound')) $id('bot-plan-inbound').value='';
+  if($id('bot-plan-save-label')) $id('bot-plan-save-label').textContent='➕ افزودن Plan';
+}
+async function loadSellPlans(){try{var d=await api('/api/bot/sell/plans');renderSellPlans(d.plans||[]);}catch(e){console.error(e);}}
+function sellPlanPayload(){return{ name:($id('bot-plan-name').value||'').trim(), price:($id('bot-plan-price').value||'').trim(), inbound_id:$id('bot-plan-inbound').value||'', traffic_gb:parseFloat($id('bot-plan-traffic').value||0), expire_days:parseInt($id('bot-plan-days').value||0,10), username_prefix:($id('bot-plan-prefix').value||'shop').trim(), enabled:true};}
+async function saveSellPlan(){try{var payload=sellPlanPayload();if(!payload.name||!payload.price||!payload.inbound_id)throw new Error('نام Plan، قیمت و Inbound الزامی است');var id=($id('bot-plan-id').value||'').trim();if(id){await api('/api/bot/sell/plans/'+encodeURIComponent(id),{method:'PATCH',body:payload});toast('Plan بروزرسانی شد','ok');}else{await api('/api/bot/sell/plans',{method:'POST',body:payload});toast('Plan اضافه شد','ok');}resetSellPlanForm();await loadSellPlans();await loadBot();}catch(e){toast(e.message||'خطا در ذخیره Plan','err');}}
+async function editSellPlan(id){try{var d=await api('/api/bot/sell/plans');var p=(d.plans||[]).find(function(x){return String(x.id)===String(id);});if(!p)throw new Error('Plan پیدا نشد');$id('bot-plan-id').value=p.id||'';$id('bot-plan-name').value=p.name||'';$id('bot-plan-price').value=p.price||'';$id('bot-plan-inbound').value=p.inbound_id||'';$id('bot-plan-traffic').value=p.traffic_gb||0;$id('bot-plan-days').value=p.expire_days||0;$id('bot-plan-prefix').value=p.username_prefix||'shop';$id('bot-plan-save-label').textContent='💾 ذخیره تغییرات';toggleBotAcc('botacc-sell-products');window.scrollTo({top:$id('tab-bot').offsetTop,behavior:'smooth'});}catch(e){toast(e.message||'خطا','err');}}
+async function toggleSellPlan(id,enabled){try{var d=await api('/api/bot/sell/plans');var p=(d.plans||[]).find(function(x){return String(x.id)===String(id);});if(!p)throw new Error('Plan پیدا نشد');p.enabled=!!enabled;await api('/api/bot/sell/plans/'+encodeURIComponent(id),{method:'PATCH',body:p});await loadSellPlans();await loadBot();toast(enabled?'Plan فعال شد':'Plan غیرفعال شد','ok');}catch(e){toast(e.message||'خطا','err');}}
+async function deleteSellPlan(id){if(!confirm('این Plan حذف شود؟'))return;try{await api('/api/bot/sell/plans/'+encodeURIComponent(id),{method:'DELETE'});resetSellPlanForm();await loadSellPlans();await loadBot();toast('Plan حذف شد','ok');}catch(e){toast(e.message||'خطا','err');}}
+function addBotJoinRow(item){var wrap=$id('bot-join-list');if(!wrap)return;item=item||{};var row=document.createElement('div');row.className='bot-join-row';row.innerHTML='<div class="f-g" style="margin:0"><label>Channel / Chat ID</label><input class="bot-join-chat" type="text" dir="ltr" placeholder="@channel یا -100123456789" value="'+escAttr(item.chat_id||item.channel||'')+'"></div><div class="f-g" style="margin:0"><label>Join Link</label><input class="bot-join-url" type="url" dir="ltr" placeholder="https://t.me/channel" value="'+escAttr(item.join_url||item.url||'')+'"></div><button class="btn-glass" type="button" onclick="this.parentElement.remove()">حذف</button>';wrap.appendChild(row);}
+function renderBotJoinRows(items){var wrap=$id('bot-join-list');if(!wrap)return;wrap.innerHTML='';(items||[]).forEach(addBotJoinRow);if(!items||!items.length)addBotJoinRow();}
+function getBotJoinPayload(){return Array.prototype.slice.call(document.querySelectorAll('#bot-join-list .bot-join-row')).map(function(row){return{chat_id:(row.querySelector('.bot-join-chat').value||'').trim(),join_url:(row.querySelector('.bot-join-url').value||'').trim()};}).filter(function(x){return x.chat_id;});}
+async function loadBot(){try{var d=await api('/api/bot/status');fillBotStatus(d);if($id('bot-token')&&!d.token_configured)$id('bot-token').value='';var ch=d.channel||{},sell=d.sell||{};$id('bot-channel-enabled').checked=!!ch.enabled;$id('bot-channel').value=ch.channel||'';$id('bot-channel-interval').value=ch.interval_minutes||60;$id('bot-channel-prefix').value=ch.username_prefix||'spider';$id('bot-channel-traffic').value=ch.traffic_limit_gb||0;$id('bot-channel-days').value=ch.expire_days||30;$id('bot-channel-replace').checked=ch.replace_previous!==false;await loadBotInbounds();$id('bot-channel-inbound').value=ch.inbound_id||'';$id('bot-sell-enabled').checked=!!sell.enabled;$id('bot-sell-admin').value=sell.admin_chat_id||'';$id('bot-sell-support').value=sell.support_username||'';$id('bot-sell-support-text').value=sell.support_text||'💬 برای پشتیبانی با مدیر فروش تماس بگیرید.';$id('bot-sell-payment').value=sell.payment_url||'';$id('bot-sell-payment-details').value=sell.payment_details||'';renderBotJoinRows(sell.required_channels||[]);}catch(e){console.error(e);}}
+function botPayload(){return{token:($id('bot-token').value||'').trim(),channel:{enabled:$id('bot-channel-enabled').checked,channel:($id('bot-channel').value||'').trim(),interval_minutes:parseInt($id('bot-channel-interval').value||60,10),username_prefix:($id('bot-channel-prefix').value||'spider').trim(),traffic_limit_gb:parseFloat($id('bot-channel-traffic').value||0),expire_days:parseInt($id('bot-channel-days').value||0,10),inbound_id:$id('bot-channel-inbound').value||'',replace_previous:$id('bot-channel-replace').checked},sell:{enabled:$id('bot-sell-enabled').checked,admin_chat_id:($id('bot-sell-admin').value||'').trim(),support_username:($id('bot-sell-support').value||'').trim(),support_text:$id('bot-sell-support-text').value||'',payment_url:($id('bot-sell-payment').value||'').trim(),payment_details:$id('bot-sell-payment-details').value||'',required_channels:getBotJoinPayload(),welcome_text:'سلام 👋\nبرای استفاده از فروشگاه یکی از بخش‌های زیر را انتخاب کنید.'}};}
+async function saveBotConfig(){try{var p=botPayload();if(!p.token){var st=await api('/api/bot/status');if(!st.token_configured)throw new Error('Telegram Bot API Key را وارد کنید');}await api('/api/bot/config',{method:'POST',body:p});await loadBot();toast('تنظیمات Bot ذخیره شد','ok');}catch(e){toast(e.message||'خطا در ذخیره تنظیمات','err');}}
+async function testBotConfig(){try{var p=botPayload();var d=await api('/api/bot/test',{method:'POST',body:{token:p.token,channel:p.channel.channel}});var msg='Bot: @'+(d.bot&&d.bot.username||'?');if(d.channel){msg+=' · Channel: '+(d.channel.username||d.channel.title||d.channel.id);if(!d.channel.is_admin)msg+=' · Bot admin نیست';}toast(msg,d.channel&&!d.channel.is_admin?'warn':'ok');}catch(e){toast(e.message||'Telegram test failed','err');}}
+async function runChannelBotNow(){try{await api('/api/bot/config',{method:'POST',body:botPayload()});var d=await api('/api/bot/channel/run',{method:'POST'});toast('کاربر '+((d.user||{}).username||'')+' ساخته و در Channel ارسال شد','ok');await loadBot();}catch(e){toast(e.message||'خطا در اجرای Channel Bot','err');}}
+
 // ─── SERVER INFO IN SETTINGS ───────────────────────────────────────────────
 async function loadServerInfo() {
   try {
@@ -4685,6 +4918,7 @@ async function generateApiKey() {
 // Add server info to settings on load
 document.addEventListener('DOMContentLoaded', function() {
   setTimeout(loadServerInfo, 500);
+  setTimeout(loadBot, 600);
 });
 
 // Start neon bars when tab opens
