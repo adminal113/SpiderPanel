@@ -5798,6 +5798,183 @@ async def update_settings(request: Request, _=Depends(require_auth)):
     return {"ok": True, "settings": s}
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKUP / RESTORE - full SpiderPanel state
+# ══════════════════════════════════════════════════════════════════════════════
+
+BACKUP_VERSION = 2
+BACKUP_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _build_backup_payload() -> dict:
+    """Build a portable JSON backup from the live in-memory state.
+
+    This intentionally mirrors save_state() so a downloaded backup can restore
+    the same entities without depending on the on-disk DATA_FILE being present.
+    Scanner saved results are included as well because they live outside the
+    main JSON state file.
+    """
+    panel_key = _get_panel_api_key_sync()
+    server_info = {
+        "public_ip": str(SETTINGS.get("server_ip") or ""),
+        "country": str(SETTINGS.get("country") or ""),
+        "country_code": str(SETTINGS.get("country_code") or "").upper(),
+        "country_flag": str(SETTINGS.get("country_flag") or "🌐"),
+        "detected_at": SETTINGS.get("server_info_detected_at") or None,
+    }
+    return {
+        "backup_format": "SpiderPanel",
+        "backup_version": BACKUP_VERSION,
+        "created_at": datetime.now().isoformat(),
+        "state": {
+            "links": dict(LINKS),
+            "users": dict(USERS),
+            "subs": dict(SUBS),
+            "settings": dict(SETTINGS),
+            "panel_api_key": panel_key,
+            "server_info": server_info,
+            "groups": dict(GROUPS),
+            "inbounds": dict(INBOUNDS),
+            "ip_pool": list(IP_POOL),
+            "ip_blacklist": list(IP_BLACKLIST),
+            "worker": dict(WORKER),
+            "nodes": dict(NODES),
+            "pending_node_deletions": dict(PENDING_NODE_DELETIONS),
+            "bot_orders": dict(BOT_ORDERS),
+            "password_hash": AUTH.get("password_hash", ""),
+            "saved_secret": CONFIG.get("secret", ""),
+        },
+        "scanner_saved": {
+            ctype: _read_scanned_ips(ctype) for ctype in sorted(_SCANNED_TYPES)
+        },
+    }
+
+
+def _validate_backup_payload(payload: dict) -> dict:
+    """Validate and normalize both v2 backups and legacy state-file backups."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="فایل بکاپ معتبر نیست")
+
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else payload
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=400, detail="ساختار فایل بکاپ نامعتبر است")
+
+    # Require a meaningful SpiderPanel state marker so arbitrary JSON cannot be
+    # accidentally imported over a live installation.
+    required_any = ("users", "settings", "links", "inbounds", "groups", "worker")
+    if not any(k in state for k in required_any):
+        raise HTTPException(status_code=400, detail="این فایل بکاپ SpiderPanel نیست")
+
+    # Keep only the expected container/value shapes. Individual records remain
+    # intentionally schema-compatible with older panel versions.
+    dict_fields = ("links", "users", "subs", "settings", "groups", "inbounds", "worker", "nodes", "pending_node_deletions", "bot_orders")
+    for key in dict_fields:
+        if key in state and not isinstance(state.get(key), dict):
+            raise HTTPException(status_code=400, detail=f"فیلد {key} در بکاپ نامعتبر است")
+    list_fields = ("ip_pool", "ip_blacklist")
+    for key in list_fields:
+        if key in state and not isinstance(state.get(key), list):
+            raise HTTPException(status_code=400, detail=f"فیلد {key} در بکاپ نامعتبر است")
+
+    return state
+
+
+@app.get("/api/settings/backup")
+async def download_backup(_=Depends(require_auth)):
+    """Download the complete current SpiderPanel state as a JSON file."""
+    payload = _build_backup_payload()
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = "spider-panel-backup-" + datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".json"
+    return Response(
+        content=body,
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/settings/restore")
+async def restore_backup(request: Request, _=Depends(require_auth)):
+    """Restore a downloaded SpiderPanel JSON backup atomically."""
+    form = await request.form()
+    file = form.get("file")
+    if not file or not hasattr(file, "read"):
+        raise HTTPException(status_code=400, detail="فایل بکاپ انتخاب نشده است")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="فایل بکاپ خالی است")
+    if len(raw) > BACKUP_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="حجم فایل بکاپ بیشتر از حد مجاز است (حداکثر 25MB)")
+
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"فایل بکاپ JSON معتبر نیست: {exc}")
+
+    state = _validate_backup_payload(payload)
+
+    # Do not mutate live state until the backup has been fully parsed and
+    # validated. The disk write is also atomic so a failed restore cannot leave
+    # a half-written spider_state.json.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    current_bytes = None
+    if DATA_FILE.exists():
+        try:
+            current_bytes = DATA_FILE.read_bytes()
+        except Exception:
+            current_bytes = None
+
+    normalized = dict(state)
+    normalized.setdefault("saved_at", datetime.now().isoformat())
+    tmp = DATA_FILE.with_name(DATA_FILE.name + ".restore.tmp")
+    try:
+        tmp.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        tmp.replace(DATA_FILE)
+
+        # Clear then reload so omitted optional fields from older backups do not
+        # leave stale current-install data behind.
+        LINKS.clear(); SUBS.clear(); USERS.clear(); GROUPS.clear(); INBOUNDS.clear()
+        NODES.clear(); PENDING_NODE_DELETIONS.clear(); BOT_ORDERS.clear()
+        IP_POOL.clear(); IP_BLACKLIST.clear(); WORKER.clear(); SETTINGS.clear()
+        await load_state()
+
+        # Restore scanner results that are stored as separate text files.
+        scanner_saved = payload.get("scanner_saved", {}) if isinstance(payload, dict) else {}
+        if not isinstance(scanner_saved, dict):
+            scanner_saved = {}
+        for ctype in _SCANNED_TYPES:
+            entries = scanner_saved.get(ctype, [])
+            if isinstance(entries, list):
+                _save_scanned_ips(ctype, [str(x) for x in entries], replace=True)
+    except HTTPException:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        # Best-effort rollback of the state file if writing/reloading failed.
+        if current_bytes is not None:
+            try:
+                DATA_FILE.write_bytes(current_bytes)
+            except Exception:
+                pass
+        logger.exception("Backup restore failed")
+        raise HTTPException(status_code=500, detail=f"بازیابی بکاپ ناموفق بود: {exc}")
+
+    await save_state()
+    log_activity("settings", "بکاپ با موفقیت بازیابی شد", "ok")
+    return {"ok": True, "detail": "بکاپ با موفقیت بازیابی شد"}
+
 @app.post("/api/settings/security-token/rotate")
 async def rotate_security_token(_=Depends(require_auth)):
     """Legacy alias for SpiderPanel API-key regeneration."""
